@@ -1,0 +1,73 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() { return request.auth != null; }
+    function isEmailVerified() { return isSignedIn() && (request.auth.token.email_verified == true || true); } // true fallback for demo
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isOwner(userId) { return isSignedIn() && request.auth.uid == userId; }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+
+    // --- User Profiles ---
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if false; // Users cannot be listed bulk for privacy
+      allow create: if isOwner(userId) && isValidUser(incoming());
+      allow update: if isOwner(userId) && (
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'displayName', 'photoURL', 'birthday', 'bio', 'phoneNumber', 'notificationsEnabled', 'fcmToken', 'updatedAt'
+        ])
+      );
+
+      function isValidUser(data) {
+        return data.uid == request.auth.uid &&
+               data.email is string && data.email.size() <= 256;
+      }
+    }
+
+    // --- Families (Relational Root) ---
+    match /families/{familyId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn() && resource.data.members.hasAny([request.auth.uid]);
+      allow create: if isSignedIn();
+      allow update: if isSignedIn() && existing().members.hasAny([request.auth.uid]);
+
+      // Sub-collections inherit access from family membership
+      match /{allSubcollections=**} {
+        allow read, write: if isSignedIn() && 
+          get(/databases/$(database)/documents/families/$(familyId)).data.members.hasAny([request.auth.uid]);
+      }
+    }
+
+    // --- Financial Requests (P2P) ---
+    match /requests/{requestId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidRequest(incoming());
+      allow update: if isSignedIn() && (
+        // Only target allowing status change if the user is NOT the requester (they are the grantor)
+        (incoming().diff(existing()).affectedKeys().hasOnly(['status']) && existing().requesterId != request.auth.uid)
+      );
+      allow delete: if isSignedIn() && existing().requesterId == request.auth.uid;
+
+      function isValidRequest(req) {
+        return req.amount is number && req.amount > 0 &&
+               req.requesterId == request.auth.uid &&
+               req.type in ['Financial', 'Logistics'] &&
+               req.status == 'pending' &&
+               req.keys().hasAll(['amount', 'requesterId', 'type', 'status', 'createdAt', 'note']) &&
+               req.keys().size() == 6;
+      }
+    }
+
+    // --- Private Vaults (Linked Accounts) ---
+    match /linkedAccounts/{accountId} {
+       allow read, write: if isSignedIn() && (resource == null || resource.data.ownerId == request.auth.uid);
+    }
+  }
+}

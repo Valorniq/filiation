@@ -1,0 +1,111 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "User profile information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "familyCode": { "type": "string" },
+        "birthday": { "type": "string" },
+        "bio": { "type": "string" },
+        "phoneNumber": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "member"] }
+      },
+      "required": ["uid", "email"]
+    },
+    "FinancialTransaction": {
+      "title": "Financial Transaction",
+      "description": "Record of a family financial transaction or request",
+      "type": "object",
+      "properties": {
+        "amount": { "type": "number" },
+        "description": { "type": "string" },
+        "requesterId": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "settled", "rejected"] },
+        "createdAt": { "type": "string" },
+        "category": { "type": "string", "enum": ["Utilities", "Subscriptions", "Food", "Entertainment", "Taxes", "Housing", "Other"] }
+      },
+      "required": ["amount", "description", "requesterId", "status", "createdAt", "category"]
+    },
+    "LinkedAccount": {
+      "title": "Linked Banking Account",
+      "description": "Read-only sync of a bank account",
+      "type": "object",
+      "properties": {
+        "institutionName": { "type": "string" },
+        "accountName": { "type": "string" },
+        "balance": { "type": "number" },
+        "currency": { "type": "string" },
+        "lastSynced": { "type": "string" },
+        "type": { "type": "string" }
+      },
+      "required": ["institutionName", "accountName", "balance"]
+    },
+    "LogisticItem": {
+      "title": "Logistic Item",
+      "description": "A scheduled logistical activity (e.g., bus route, pickup)",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "type": { "type": "string", "enum": ["bus", "car", "grocery", "other"] },
+        "time": { "type": "string" },
+        "status": { "type": "string" },
+        "assignedTo": { "type": "string" }
+      },
+      "required": ["title", "time"]
+    },
+    "CalendarEvent": {
+      "title": "Calendar Event",
+      "description": "A shared family calendar event",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "startTime": { "type": "string" },
+        "endTime": { "type": "string" },
+        "location": { "type": "string" },
+        "isUrgent": { "type": "boolean" },
+        "attendees": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["title", "startTime"]
+    },
+    "Family": {
+      "title": "Family Hub",
+      "description": "Family group settings and members",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "code": { "type": "string" },
+        "adminId": { "type": "string" }
+      },
+      "required": ["name", "code"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Individual user settings"
+    },
+    "/families/{familyId}": {
+      "schema": "Family",
+      "description": "Root family document"
+    },
+    "/families/{familyId}/finances/{transactionId}": {
+      "schema": "FinancialTransaction",
+      "description": "Family financial records"
+    },
+    "/families/{familyId}/logistics/{itemId}": {
+      "schema": "LogisticItem",
+      "description": "Family logistics"
+    },
+    "/families/{familyId}/events/{eventId}": {
+      "schema": "CalendarEvent",
+      "description": "Shared calendar events"
+    }
+  }
+}

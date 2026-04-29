@@ -1,0 +1,82 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Check if user is a member of the family
+    function isFamilyMember(familyId) {
+      return isSignedIn() && exists(/databases/$(database)/documents/families/$(familyId)/members/$(request.auth.uid));
+    }
+
+    // --- User Rules ---
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUser(incoming());
+      allow update: if isOwner(userId) && isValidUser(incoming()) && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'familyCode']);
+
+      function isValidUser(data) {
+        return data.uid == request.auth.uid &&
+               data.email is string && data.email.size() <= 256;
+      }
+    }
+
+    // --- Family Rules ---
+    match /families/{familyId} {
+      allow get: if isSignedIn(); // Simplified for initial join via code
+      allow list: if false; // No blanket listing
+      allow create: if isSignedIn() && isEmailVerified();
+      allow update: if isFamilyMember(familyId); // Should be admin usually, but keeping it simple for now
+    }
+
+    match /families/{familyId}/finances/{transactionId} {
+      allow read: if isFamilyMember(familyId);
+      allow create: if isFamilyMember(familyId) && isValidTransaction(incoming());
+      allow update: if isFamilyMember(familyId) && isValidTransaction(incoming()) && 
+                    incoming().diff(existing()).affectedKeys().hasOnly(['status']);
+
+      function isValidTransaction(data) {
+        return data.amount is number && 
+               data.requesterId == request.auth.uid &&
+               data.status in ['pending', 'settled', 'rejected'];
+      }
+    }
+
+    match /families/{familyId}/logistics/{itemId} {
+      allow read: if isFamilyMember(familyId);
+      allow write: if isFamilyMember(familyId);
+    }
+
+    match /families/{familyId}/events/{eventId} {
+      allow read: if isFamilyMember(familyId);
+      allow write: if isFamilyMember(familyId);
+    }
+  }
+}
