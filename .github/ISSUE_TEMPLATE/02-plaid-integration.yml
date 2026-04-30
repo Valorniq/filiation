@@ -1,0 +1,63 @@
+name: "🏦 Plaid External Account Linking"
+description: "Build secure server-side Plaid integration via Firebase Cloud Functions for bank accounts, credit cards, transactions, balances, and stock portfolios."
+title: "[Integration] Plaid External Account Linking – Bank, Credit, Transactions, Credit Score & Stock Portfolio"
+labels: ["integration", "priority: high", "type: feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Context
+        There is currently no mechanism for linking real financial accounts. This issue covers the full Plaid integration: server-side link token creation, public token exchange, encrypted access token storage, on-demand and scheduled data fetching, webhook handling, and the stock portfolio connection. The client **must never** receive or store a Plaid `access_token`.
+
+        Reference documents: [`ARCHITECTURE.md § External Integrations`](../ARCHITECTURE.md#external-integrations) · [`SECURITY.md § Encrypted Storage`](../SECURITY.md#encrypted-storage-for-linked-accounts)
+
+  - type: checkboxes
+    id: tasks
+    attributes:
+      label: Implementation Checklist
+      options:
+        - label: "**Plaid account setup** – Create a Plaid developer account; obtain `PLAID_CLIENT_ID` and `PLAID_SECRET` (Sandbox → Development → Production); store both in Firebase Secret Manager."
+        - label: "**Install Plaid SDK** in Cloud Functions: `npm install plaid` (functions directory)."
+        - label: "**`plaid/createLinkToken` Cloud Function** – Callable; validates adult role + rate limit (3/hr/uid); calls `/link/token/create` with `products: ['transactions']` and `country_codes: ['US']`; returns only the `link_token` to the client."
+        - label: "**Plaid Link widget in Settings UI** – Adult-only section in `ProfileSettings.tsx`; load Plaid Link SDK (`react-plaid-link`); open widget on button click; on `onSuccess` send `public_token` to `plaid/exchangePublicToken`."
+        - label: "**`plaid/exchangePublicToken` Cloud Function** – Callable; validates adult role + rate limit (3/hr/uid); calls `/item/public_token/exchange`; encrypts `access_token` with AES-256-GCM via Google Cloud KMS (or a KMS-wrapped symmetric key stored in Secret Manager); writes encrypted blob to `/users/{uid}/private/linkedAccounts/{itemId}` via Admin SDK — **no client-readable path**."
+        - label: "**Firestore rules for `/users/{uid}/private/**`** – Deny all client reads and writes; access only via Admin SDK (Cloud Functions)."
+        - label: "**`plaid/fetchTransactions` Cloud Function** – Callable + scheduled (daily cron); decrypts `access_token`; calls Plaid `/transactions/sync`; writes normalised transactions to `/families/{familyId}/transactions/{txId}`; rate limit: 30/hr/uid."
+        - label: "**`plaid/fetchBalances` Cloud Function** – Callable; decrypts `access_token`; calls Plaid `/accounts/balance/get`; writes to `/families/{familyId}/linkedAccountsSummary/{accountId}` (public metadata only — no raw tokens); rate limit: 60/hr/uid."
+        - label: "**`plaid/webhookHandler` HTTPS endpoint** – Verify Plaid webhook JWT signature; handle `TRANSACTIONS_REMOVED`, `DEFAULT_UPDATE`, `HISTORICAL_UPDATE`, `ITEM_ERROR` events; trigger incremental transaction sync or emit in-app notification."
+        - label: "**Account unlink flow** – Call Plaid `/item/remove`; delete encrypted `access_token` from Firestore; update family feature-flag state; log to audit trail."
+        - label: "**Credit card support** – Add `products: ['liabilities']` to link token creation when adult opts in; fetch credit card balances and payment due dates via `/liabilities/get`."
+        - label: "**Credit score display** – Note: Plaid does not provide credit scores directly. Integrate a partner API (e.g. Credit Karma SDK, Experian Connect, or manual input) OR implement a simulated credit score model for educational purposes when `educationMode` flag is enabled."
+        - label: "**Stock portfolio connection** – Add `products: ['investments']` to link token creation (brokerage accounts); fetch holdings via `/investments/holdings/get` and transactions via `/investments/transactions/get`; display in a read-only portfolio panel."
+        - label: "**Manual stock watchlist** – For families without brokerage accounts: implement a manual symbol watchlist stored in Firestore; fetch public price data from a free API (e.g. Yahoo Finance unofficial, Alpha Vantage) in a scheduled Cloud Function."
+        - label: "**Education mode fallback** – When `educationMode` is true or no accounts are linked, show simulated/demo transaction data so children can still learn from realistic examples."
+        - label: "**Sync status UI** – Update `SyncHub.tsx` to show real linked account status, last-synced timestamp, and a manual refresh button (rate-limited)."
+        - label: "**Plaid rate limit layer** – Apply limits from `docs/rate-limiting.md` to all Plaid-related Cloud Functions."
+        - label: "**Audit logging** – Log `PLAID_LINK`, `PLAID_UNLINK`, `PLAID_SYNC` actions to `/auditLog`."
+        - label: "**Integration tests** – Test all Cloud Functions against the Plaid Sandbox environment using the Firebase Emulator Suite."
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      value: |
+        - [ ] Adult can complete the full Plaid Link flow from Settings UI in Sandbox mode.
+        - [ ] `access_token` is never present in any Firestore document readable by the client.
+        - [ ] Transactions appear in the Financial Hub within 60 seconds of a sandbox webhook.
+        - [ ] Unlinking an account removes all associated tokens and updates the feature flag.
+        - [ ] Education mode shows realistic demo data when no account is linked.
+        - [ ] All Plaid Cloud Functions enforce rate limits and log to the audit trail.
+        - [ ] Child accounts cannot access the Plaid link flow.
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      value: |
+        - [ARCHITECTURE.md § External Integrations](../ARCHITECTURE.md#external-integrations)
+        - [SECURITY.md § Encrypted Storage](../SECURITY.md#encrypted-storage-for-linked-accounts)
+        - [Plaid Quickstart](https://plaid.com/docs/quickstart/)
+        - [Plaid Transactions Sync](https://plaid.com/docs/transactions/sync/)
+        - [Plaid Investments](https://plaid.com/docs/investments/)
+        - [react-plaid-link](https://github.com/plaid/react-plaid-link)
+        - [Google Cloud KMS](https://cloud.google.com/kms/docs)

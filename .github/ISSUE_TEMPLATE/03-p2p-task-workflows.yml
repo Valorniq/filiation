@@ -1,0 +1,66 @@
+name: "🔄 P2P Requests & Task Management System"
+description: "Build the Firestore-based P2P request engine and task/vacation-planning workflow with adult oversight, child submission, approval flows, notifications, and audit trails."
+title: "[Feature] P2P Requests & Task Management – Ride, Transfer, IOU, Vacation Planning, Task Board"
+labels: ["feature", "priority: high", "type: feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Context
+        No P2P request or task management system exists yet. This issue covers the full Firestore-based workflow engine: multiple request types (ride, transfer/IOU, vacation planning), adult task assignment, child plan submission, adult review/approve/reject, booking confirmation, simulated transaction logging, FCM/in-app notifications, and gamified child views vs. adult oversight dashboards.
+
+        Reference documents: [`ARCHITECTURE.md § P2P Requests & Task Workflow Engine`](../ARCHITECTURE.md#p2p-requests--task-workflow-engine) · [`ARCHITECTURE.md § Data Model`](../ARCHITECTURE.md#data-model)
+
+  - type: checkboxes
+    id: tasks
+    attributes:
+      label: Implementation Checklist
+      options:
+        - label: "**Firestore schema** – Create/update collections: `/families/{familyId}/requests/{requestId}`, `/families/{familyId}/tasks/{taskId}`, `/families/{familyId}/plans/{planId}` as defined in `ARCHITECTURE.md § Data Model`."
+        - label: "**Firestore rules – requests** – Restrict create to family members; restrict status updates to non-requester family adults; restrict read to family members only."
+        - label: "**Firestore rules – tasks** – Adults can create/update; assigned child can update status to 'submitted'; read restricted to assignee and family adults."
+        - label: "**Firestore rules – plans** – Child (assignee) can create/update draft plans; adults can read and update status; read restricted to submitter and family adults."
+        - label: "**`requests/createRequest` Cloud Function** – Validate type (Ride|Transfer|IOU|Vacation|Task), amount range, requester is family member; enforce rate limit (20/5min/uid); write to Firestore; trigger notification to target."
+        - label: "**`requests/updateRequestStatus` Cloud Function** – Validate caller is adult family member and not the requester; allow transitions: `pending→approved`, `pending→rejected`, `approved→booked`, `booked→completed`; trigger notification to requester; log to audit trail."
+        - label: "**Transfer / IOU request UI** – Child-facing form in `/requests` view: select family member, enter amount and note; show pending/approved/rejected status list."
+        - label: "**Ride request UI** – Child-facing form: select pickup location (or use predefined places), time, and requesting parent/guardian; adult sees 'Accept Ride' button; on acceptance status → `confirmed`."
+        - label: "**`tasks/assignTask` Cloud Function** – Adult-callable; creates task document; notifies child via FCM."
+        - label: "**Task Board UI (adult view)** – List all tasks per child with status badges (unstarted, in-progress, submitted, approved, rejected); button to create new task."
+        - label: "**Task Board UI (child view)** – Gamified list of assigned tasks with progress indicators; 'Start Plan' button for vacation/budget tasks."
+        - label: "**`tasks/submitPlan` Cloud Function** – Child-callable; validates budget breakdown completeness (all required fields present, contingency ≥ 10% of total); transitions task status to `submitted`; creates a linked `/plans/{planId}` document; notifies adult."
+        - label: "**Vacation planner UI (child)** – Multi-step form under `/tasks/:id/plan`: transportation, lodging, food, souvenirs, contingency fields; running total with visual budget bar; submit button triggers `tasks/submitPlan`."
+        - label: "**`tasks/reviewPlan` Cloud Function** – Adult-callable; adds comment; transitions plan status to `approved` or `rejected`; on approval, optionally logs a simulated transaction to `/families/{id}/transactions`; notifies child."
+        - label: "**Plan review UI (adult)** – Show full budget breakdown, child's narrative, total vs. family budget; comment input; Approve / Request Changes / Reject buttons."
+        - label: "**'Mark as Booked' flow** – After adult approves a plan, show 'Mark as Booked' button; on click, call `updateRequestStatus` to set `booked`; log real or simulated transaction."
+        - label: "**Simulated transaction logging** – When `educationMode` is true or a plan is approved without real Plaid data, write a mock transaction to `/families/{id}/transactions` tagged `source: 'simulated'`."
+        - label: "**Full audit trail** – Every state transition (create, approve, reject, book, complete) logged to `/auditLog`."
+        - label: "**FCM notifications** – Send push notifications for: new request, request approved/rejected, new task assigned, plan submitted, plan reviewed. Use `sendFcmNotification` Cloud Function."
+        - label: "**In-app notification centre** – Bell icon in Layout showing unread notifications from a `/notifications/{uid}/{notifId}` sub-collection; mark-as-read functionality."
+        - label: "**Conditional visibility** – Entire `/requests` and `/tasks` routes hidden when `p2pRequests` or `taskBoard` feature flags are false (see `FeatureFlagContext`)."
+        - label: "**Unit tests** – Test Cloud Function state-machine transitions with Firebase Emulator; test that children cannot approve requests."
+        - label: "**E2E test** – Playwright test covering: adult assigns task → child submits vacation plan → adult approves → adult marks as booked."
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      value: |
+        - [ ] Child can submit a Transfer, IOU, and Ride request from the UI.
+        - [ ] Adult receives a push notification for each new request.
+        - [ ] Adult can approve, reject, or mark a request as booked.
+        - [ ] Child cannot approve their own request (enforced in Firestore rules and Cloud Function).
+        - [ ] Vacation plan submission requires all budget fields and contingency ≥ 10%.
+        - [ ] Every state transition is recorded in `/auditLog`.
+        - [ ] Disabling `p2pRequests` flag hides the entire requests section for all family members.
+        - [ ] Education mode logs a simulated transaction on plan approval.
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      value: |
+        - [ARCHITECTURE.md § P2P Requests & Task Workflow Engine](../ARCHITECTURE.md#p2p-requests--task-workflow-engine)
+        - [ARCHITECTURE.md § Data Model](../ARCHITECTURE.md#data-model)
+        - [ARCHITECTURE.md § Notification Architecture](../ARCHITECTURE.md#notification-architecture)
+        - [Firebase Cloud Messaging](https://firebase.google.com/docs/cloud-messaging)
+        - [Firestore Security Rules](https://firebase.google.com/docs/firestore/security/get-started)

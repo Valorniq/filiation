@@ -1,0 +1,68 @@
+name: "⚖️ COPPA, GDPR & Privacy Compliance Review"
+description: "Implement verifiable parental consent for under-13 accounts, GDPR data rights endpoints, Privacy Policy, Terms of Service, data minimisation audit, and third-party processor documentation."
+title: "[Compliance] COPPA, GDPR & Privacy Compliance – Consent Flows, Data Rights, Privacy Policy, ToS"
+labels: ["compliance", "privacy", "priority: critical", "type: task"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Context
+        Filiation serves minors and processes financial data. Compliance with COPPA (US) and GDPR (EU/UK) is **legally required** before onboarding any real users. This issue covers verifiable parental consent for children under 13, GDPR data subject rights (access, erasure, portability), Privacy Policy, Terms of Service, data minimisation audit, third-party processor documentation, and ongoing compliance monitoring.
+
+        Reference documents: [`SECURITY.md § COPPA & GDPR Compliance`](../SECURITY.md#coppa--gdpr-compliance) · [`ARCHITECTURE.md § Role & Permission System`](../ARCHITECTURE.md#role--permission-system)
+
+  - type: checkboxes
+    id: tasks
+    attributes:
+      label: Implementation Checklist
+      options:
+        - label: "**Age gate on registration** – Add a date-of-birth field to the sign-up flow; if the entered age is under 13, block self-registration and show a message directing the parent to create a child account from their own account dashboard."
+        - label: "**Child account creation flow (parent-initiated)** – In adult Settings, add 'Add Child Account' section; adult enters child's name, year of birth, and email (optional); adult provides verifiable parental consent (see next items)."
+        - label: "**Verifiable parental consent (VPC) mechanism** – Implement at least one FTC-approved VPC method, for example: (a) credit/debit card micro-charge verification, (b) signed consent form upload, or (c) knowledge-based identity check. Record `consentMethod`, `consentTimestamp`, and `consentRecordId` in `/families/{id}/members/{uid}`."
+        - label: "**Consent record storage** – Store consent records in a restricted Firestore collection (`/consentRecords/{recordId}`) accessible only via the Admin SDK; write-only from Cloud Functions; never client-readable."
+        - label: "**COPPA data minimisation for children** – Audit all data collected for child accounts; remove any field not strictly necessary; document the purpose of each retained field in a data map."
+        - label: "**No third-party advertising for children** – Audit all third-party SDKs and APIs used in the app; ensure none serve behavioural advertising or track children for advertising purposes; document findings."
+        - label: "**Gemini API usage review** – Review what data is sent to the Gemini API; ensure child messages/financial data are not used for model training; add a data processing agreement (DPA) check with Google."
+        - label: "**GDPR consent checkboxes on sign-up** – Add separate, granular consent checkboxes for: (1) account operation, (2) financial data processing, (3) AI coaching (Gemini), (4) push notifications. Record timestamp and consent version for each."
+        - label: "**Privacy Policy** – Write and publish a Privacy Policy at `/privacy` that covers: data collected, purpose, retention periods, third-party processors (Firebase, Plaid, Gemini, Upstash), children's data handling, parental rights, contact information for data requests."
+        - label: "**Terms of Service** – Write and publish Terms of Service at `/terms` that covers: service description, age requirements, parental responsibility, limitation of liability (especially for educational financial simulations), account termination."
+        - label: "**Link Privacy Policy and ToS from sign-up** – Display links to both documents on the registration screen before the user can proceed; require explicit acceptance checkbox."
+        - label: "**`GET /api/export-my-data` endpoint** – Cloud Function that collects all documents belonging to the requesting user across all collections and returns a JSON export; requires authenticated request + rate limit."
+        - label: "**`DELETE /api/delete-my-data` endpoint** – Cloud Function that cascades deletion of all user data: `/users/{uid}`, `/users/{uid}/private/**`, all family member references, all requests/tasks/plans authored by the user, FCM tokens, audit log entries (redacted to actor ID only); requires authenticated request + rate limit."
+        - label: "**Parental data access** – Adult account holders can request and receive an export of their linked child's data; adult can also initiate deletion of a child account."
+        - label: "**Data retention policy** – Define and document retention periods: active user data (indefinitely while account exists), deleted user data (purge within 30 days), audit logs (retain 2 years for legal compliance), Plaid transaction cache (retain 13 months per Plaid requirements)."
+        - label: "**Implement data retention Cloud Function** – Scheduled daily Cloud Function that deletes soft-deleted user records older than 30 days and prunes audit logs older than 2 years."
+        - label: "**Third-party processor documentation** – List all processors in the Privacy Policy with their DPA links: Google Firebase, Plaid, Google Gemini, Upstash. Ensure DPAs are in place for GDPR Article 28 compliance."
+        - label: "**Cookie / local storage audit** – Document all browser storage usage; ensure no tracking cookies are set without consent; implement a consent banner if any analytics cookies are used."
+        - label: "**Security vulnerability disclosure** – Publish the contact email in `SECURITY.md` and link it from the Privacy Policy; register a GitHub Security Advisory process."
+        - label: "**Legal review** – Have a qualified privacy attorney review the Privacy Policy, Terms of Service, and consent flows before launch."
+        - label: "**Compliance documentation** – Create an internal data processing record (Article 30 GDPR register) documenting each processing activity, legal basis, data categories, and retention periods."
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      value: |
+        - [ ] Users under 13 cannot self-register; the age gate redirects to parent-initiated flow.
+        - [ ] Parental consent is recorded with method, timestamp, and record ID before a child account is activated.
+        - [ ] `/api/export-my-data` returns all user data within 30 seconds.
+        - [ ] `/api/delete-my-data` removes all user data and returns success; child account also deleted from family roster.
+        - [ ] Privacy Policy and Terms of Service are linked from the sign-up screen and accessible at `/privacy` and `/terms`.
+        - [ ] Separate GDPR consent checkboxes are present on sign-up for each data processing purpose.
+        - [ ] No third-party advertising SDKs or tracking cookies are present in production build.
+        - [ ] Data retention Cloud Function correctly purges soft-deleted records after 30 days.
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      value: |
+        - [SECURITY.md § COPPA & GDPR Compliance](../SECURITY.md#coppa--gdpr-compliance)
+        - [FTC – Complying with COPPA: FAQs](https://www.ftc.gov/business-guidance/resources/complying-coppa-frequently-asked-questions)
+        - [FTC – Verifiable Parental Consent Methods](https://www.ftc.gov/system/files/documents/federal_register_notices/2013/01/130117copp.pdf)
+        - [GDPR Article 8 – Conditions for child's consent](https://gdpr-info.eu/art-8-gdpr/)
+        - [GDPR Article 17 – Right to erasure](https://gdpr-info.eu/art-17-gdpr/)
+        - [GDPR Article 20 – Right to data portability](https://gdpr-info.eu/art-20-gdpr/)
+        - [GDPR Article 28 – Processor obligations](https://gdpr-info.eu/art-28-gdpr/)
+        - [GDPR Article 30 – Records of processing activities](https://gdpr-info.eu/art-30-gdpr/)
+        - [ICO Children's Code](https://ico.org.uk/for-organisations/uk-gdpr-guidance-and-resources/childrens-information/childrens-code/)

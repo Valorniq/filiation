@@ -1,0 +1,66 @@
+name: "🔒 Security Foundation"
+description: "Implement the full security baseline required before production: App Check, rate limiting, headers, Firestore rules, audit logging, and COPPA/GDPR consent flows."
+title: "[Security] Security Foundation – App Check, Rate Limiting, Headers, Firestore Rules & Compliance Flows"
+labels: ["security", "priority: critical", "type: feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Context
+        The application currently has **no** Firebase App Check enforcement, no rate limiting on any endpoint, permissive Firestore rules (including a `|| true` fallback in `isEmailVerified()`), no HTTP security headers, no audit log, and no COPPA/GDPR consent flows. All of these must be in place before any real user data is stored.
+
+        Reference documents: [`SECURITY.md`](../SECURITY.md) · [`docs/rate-limiting.md`](../docs/rate-limiting.md) · [`ARCHITECTURE.md`](../ARCHITECTURE.md)
+
+  - type: checkboxes
+    id: tasks
+    attributes:
+      label: Implementation Checklist
+      options:
+        - label: "**App Check** – Register the web app with reCAPTCHA Enterprise; initialise `initializeAppCheck()` in `src/lib/firebase.ts`; enable enforcement in the Firebase console for Firestore, Cloud Functions, and Storage; wire `VITE_RECAPTCHA_SITE_KEY` via `.env.local`; add debug token support for CI."
+        - label: "**Remove `|| true` fallback** in `isEmailVerified()` in `firestore.rules`."
+        - label: "**Firestore rules – families** – Restrict `allow get` to family members only (not all signed-in users); enumerate explicit sub-collections instead of wildcard `/{allSubcollections=**}`."
+        - label: "**Firestore rules – requests** – Restrict `allow read` to family members only."
+        - label: "**Firestore rules – linkedAccounts** – Add `request.resource.data.ownerId == request.auth.uid` validation on create; remove `resource == null` bypass."
+        - label: "**Firestore rules – role enforcement** – Add `isAdult()` and `isChild()` helper functions reading from custom claims; gate financial and admin collections to adults only."
+        - label: "**Cloud Functions scaffold** – Initialise the `functions/` directory (`firebase init functions --typescript`); configure ESLint, Prettier, and `tsconfig.json`."
+        - label: "**Rate limiting middleware** – Install `@upstash/ratelimit` and `@upstash/redis`; implement `enforceRateLimit()` middleware as described in `docs/rate-limiting.md`; store Upstash credentials in Firebase Secret Manager."
+        - label: "**Auth rate limits** – Wrap sign-in, sign-up, and password-reset paths with 5 req / 15 min per IP+UID sliding window."
+        - label: "**General Cloud Function rate limits** – Apply 60 req / min / UID default limit to all callable functions."
+        - label: "**HTTP security headers** – Add `Strict-Transport-Security`, `Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, and `Permissions-Policy` to `firebase.json` hosting headers config."
+        - label: "**Audit log collection** – Create `/auditLog/{logId}` Firestore collection; implement append-only `logAction()` Cloud Function; add Firestore rules (write: authenticated Cloud Functions via Admin SDK only; read: adult admin of same family)."
+        - label: "**Log sensitive actions** – Call `logAction()` for: sign-in/out, failed sign-in, Plaid link/unlink, request approve/reject, role change, family member add/remove, admin settings change."
+        - label: "**MFA for adult accounts** – Enable Firebase Phone MFA; require MFA completion before linking a bank account via Plaid."
+        - label: "**Email verification gate** – Require `email_verified == true` (no fallback) before granting access to financial features; add email verification prompt in `AuthEntrance.tsx`."
+        - label: "**COPPA consent flow** – Block self-registration for children under 13; require an adult to create child accounts; implement verifiable parental consent storage (`parentalConsentObtained`, `parentalConsentTimestamp`, `consentMethod`) in `/families/{id}/members/{uid}`."
+        - label: "**GDPR consent flow** – Add explicit consent checkboxes for each data category on sign-up; link Privacy Policy and Terms of Service from the sign-up form."
+        - label: "**Data export endpoint** – Implement `GET /api/export-my-data` Cloud Function (GDPR right of access)."
+        - label: "**Data deletion endpoint** – Implement `DELETE /api/delete-my-data` Cloud Function (GDPR right to erasure); cascade-delete all user sub-collections."
+        - label: "**`npm audit` in CI** – Add a GitHub Actions workflow step that fails on high/critical vulnerabilities."
+        - label: "**Add `firebase-applet-config.json` to `.gitignore`** – This file contains Firebase project credentials and must not be committed."
+        - label: "**Firestore rules unit tests** – Add `@firebase/rules-unit-testing` tests achieving 100% rule coverage."
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      value: |
+        - [ ] All Firestore operations from an unauthenticated client are rejected.
+        - [ ] A request without a valid App Check token is rejected before reaching any Cloud Function.
+        - [ ] 6th login attempt within 15 minutes from the same IP returns `resource-exhausted`.
+        - [ ] All HTTP responses include the required security headers.
+        - [ ] Every sensitive action appears in `/auditLog`.
+        - [ ] Child accounts under 13 cannot be self-created; parental consent is required.
+        - [ ] `npm audit` reports zero high/critical vulnerabilities.
+        - [ ] Firestore rules unit tests pass with 100% coverage.
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      value: |
+        - [SECURITY.md](../SECURITY.md)
+        - [docs/rate-limiting.md](../docs/rate-limiting.md)
+        - [Firebase App Check docs](https://firebase.google.com/docs/app-check)
+        - [Upstash Rate Limit](https://upstash.com/docs/oss/sdks/ts/ratelimit/overview)
+        - [COPPA guidance (FTC)](https://www.ftc.gov/business-guidance/resources/complying-coppa-frequently-asked-questions)
+        - [GDPR Article 17 – Right to erasure](https://gdpr-info.eu/art-17-gdpr/)

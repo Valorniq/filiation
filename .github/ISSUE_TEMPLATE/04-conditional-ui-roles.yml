@@ -1,0 +1,61 @@
+name: "👁️ Conditional UI & Role-Based Visibility"
+description: "Implement the FeatureFlagContext, RoleContext, family settings admin UI, and conditional rendering so that disabled or unlinked features are completely hidden from children and adults alike."
+title: "[Feature] Conditional UI & Role-Based Visibility – FeatureFlagContext, RoleContext, Feature Toggles"
+labels: ["feature", "priority: high", "type: feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Context
+        Currently every route is visible to every authenticated user regardless of role or family settings. This issue covers implementing the complete role system (adult/child via Firebase custom claims), the `FeatureFlagContext` driven by real-time Firestore listeners on `families/{id}/settings`, and the resulting conditional rendering throughout every view. When a feature is disabled by a family admin or an external account is unlinked, the corresponding components, routes, and navigation items must disappear instantly for all connected clients.
+
+        Reference documents: [`ARCHITECTURE.md § Role & Permission System`](../ARCHITECTURE.md#role--permission-system) · [`ARCHITECTURE.md § Feature Flag & Conditional Visibility System`](../ARCHITECTURE.md#feature-flag--conditional-visibility-system)
+
+  - type: checkboxes
+    id: tasks
+    attributes:
+      label: Implementation Checklist
+      options:
+        - label: "**Custom claims Cloud Function** – Implement `admin/setCustomClaims` callable (admin-only); sets `{ role: 'adult' | 'child', familyId: string }` on the Firebase Auth user; force token refresh on the client after claim change; log to audit trail."
+        - label: "**`userProfiles` collection** – Add `role` field to `/users/{uid}` mirrored from custom claim (display only); add `familyId` foreign key; update `AuthContext.tsx` to read and expose role."
+        - label: "**`RoleContext`** – Create `src/contexts/RoleContext.tsx`; derive `isAdult` and `isChild` booleans from `auth.currentUser.getIdTokenResult()`; expose via `useRole()` hook; refresh on token change."
+        - label: "**`FamilyContext`** – Create `src/contexts/FamilyContext.tsx`; real-time `onSnapshot` listener on `/families/{familyId}`; expose family document and member list via `useFamily()` hook."
+        - label: "**`FeatureFlagContext`** – Create `src/contexts/FeatureFlagContext.tsx`; real-time `onSnapshot` listener on `/families/{familyId}/settings`; expose all feature flags via `useFeatureFlags()` hook; defaults all flags to `false` while loading to prevent flash of unauthorised content."
+        - label: "**Family settings document** – On family creation, write a default `settings` document with all flags set to `false`; adult admin can toggle flags in the Settings UI."
+        - label: "**Family settings admin UI** – Add a 'Feature Toggles' section to `ProfileSettings.tsx` (visible to adult admin only); toggle switches for each feature flag: Bank Linking, Credit Score, Rent Simulation, Stock Portfolio, P2P Requests, Task Board, Vacation Planning, Education Mode."
+        - label: "**Wrap App in new context providers** – Update `App.tsx` to wrap children with `FamilyProvider`, `RoleProvider`, and `FeatureFlagProvider` inside `AuthProvider`."
+        - label: "**ProtectedRoute enhancement** – Extend `ProtectedRoute` to accept an optional `requiredRole` and `requiredFlag` prop; redirect or show 'Feature not enabled' when conditions are not met."
+        - label: "**Home dashboard – conditional cards** – Hide Burn Rate / Financial card when `bankLinking` flag is false; hide P2P request shortcut when `p2pRequests` is false; hide task shortcut when `taskBoard` is false."
+        - label: "**FinancialHub – conditional sections** – Bank account summary: hidden when `bankLinking` false or no linked account; Credit score widget: hidden when `creditScore` false; Rent simulation: hidden when `rentSimulation` false; Stock portfolio: hidden when `stockPortfolio` false."
+        - label: "**FinancialHub – child role restrictions** – Children see only their allowance balance and approved transactions; all adult financial details are hidden regardless of feature flags."
+        - label: "**LogisticsHub – conditional sections** – Ride request button: hidden when `p2pRequests` false; show child-safe simplified view for child role."
+        - label: "**Navigation / Layout** – Remove nav items for `/requests` when `p2pRequests` false; remove `/tasks` when `taskBoard` false; remove Sync Hub link when `bankLinking` false and no other linked services; hide Settings sections irrelevant to child role."
+        - label: "**SyncHub – conditional** – Show full account linking interface to adults when `bankLinking` enabled; show education mode notice to children or when flag is false."
+        - label: "**Education mode fallback** – When `educationMode` flag is true, replace all real data displays with clearly labelled simulated data; show 'Learning Mode' badge in the header."
+        - label: "**Loading state** – During context initialisation, show a skeleton/spinner instead of the actual content to prevent unauthorised content flash."
+        - label: "**Role-based redirect on login** – After sign-in, redirect adult to home dashboard; redirect child to a simplified child home view (if implemented) or the standard home with child-filtered content."
+        - label: "**Storybook or Vitest component tests** – Test each conditional component with mock contexts for both adult/child roles and each feature flag combination."
+        - label: "**E2E test** – Playwright test: adult disables `p2pRequests` flag → verify requests nav item disappears for child within 3 seconds (real-time listener)."
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      value: |
+        - [ ] Child account cannot see credit score, bank balances, Plaid linking, or adult settings.
+        - [ ] Disabling a feature flag in Settings hides the corresponding UI for all family members within 3 seconds (real-time Firestore listener).
+        - [ ] Education mode replaces all real financial data with clearly labelled simulated figures.
+        - [ ] No route is directly accessible by a child that requires adult role (ProtectedRoute enforces role).
+        - [ ] All context providers default to the most restrictive state while loading.
+        - [ ] Feature toggles section in Settings is only visible to the adult admin of the family.
+
+  - type: textarea
+    id: references
+    attributes:
+      label: References
+      value: |
+        - [ARCHITECTURE.md § Role & Permission System](../ARCHITECTURE.md#role--permission-system)
+        - [ARCHITECTURE.md § Feature Flag & Conditional Visibility System](../ARCHITECTURE.md#feature-flag--conditional-visibility-system)
+        - [ARCHITECTURE.md § Frontend Architecture](../ARCHITECTURE.md#frontend-architecture)
+        - [Firebase Custom Claims](https://firebase.google.com/docs/auth/admin/custom-claims)
+        - [Firestore onSnapshot](https://firebase.google.com/docs/firestore/query-data/listen)
