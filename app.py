@@ -7,6 +7,7 @@ import hmac
 import html
 import json
 import os
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,6 +15,8 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
+
+import goog
 
 
 def load_env_file(path: Path) -> None:
@@ -39,6 +42,7 @@ PORT = int(os.environ.get("PORT", "3000"))
 SECRET = os.environ.get("FILIATION_SECRET", "local-filiation-dev-secret").encode()
 DATA_DIR = Path(os.environ.get("FILIATION_DATA_DIR", "data"))
 USERS_FILE = DATA_DIR / "users.json"
+GOOGLE_TOKENS_FILE = DATA_DIR / "google_tokens.json"
 API_TIMEOUT = float(os.environ.get("FILIATION_API_TIMEOUT", "8"))
 
 
@@ -162,7 +166,28 @@ def http_json(
         raise IntegrationError(str(error)) from error
 
 
-def integration_card(name: str, connected: bool, detail: str, error: str = "") -> str:
+def http_form_json(url: str, fields: dict[str, Any]) -> Any:
+    request = Request(
+        url,
+        data=urlencode(fields).encode(),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Filiation/1.0 (local integration client)",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=API_TIMEOUT) as response:
+            return json.loads(response.read().decode() or "{}")
+    except HTTPError as error:
+        detail = error.read().decode(errors="replace")[:500]
+        raise IntegrationError(f"{error.code} from {url}: {detail}") from error
+    except (URLError, TimeoutError, json.JSONDecodeError) as error:
+        raise IntegrationError(str(error)) from error
+
+
+def integration_card(name: str, connected: bool, detail: str, error: str = "", action: str = "") -> str:
     status = "Connected" if connected and not error else "Error" if error else "Not configured"
     status_class = "success" if connected and not error else "danger" if error else ""
     message = error or detail
@@ -170,6 +195,7 @@ def integration_card(name: str, connected: bool, detail: str, error: str = "") -
     <div class="integration-card">
       <div class="split"><strong>{esc(name)}</strong><span class="status {status_class}">{esc(status)}</span></div>
       <p>{esc(message)}</p>
+      {action}
     </div>
     """
 
@@ -209,6 +235,94 @@ def iso_datetime(day: dt.date, end: bool = False) -> str:
     return f"{day.isoformat()}T{time}"
 
 
+def google_redirect_uri(handler: BaseHTTPRequestHandler | None = None) -> str:
+    configured = env("GOOGLE_REDIRECT_URI")
+    if configured:
+        return configured
+    if handler:
+        host = handler.headers.get("Host", f"{HOST}:{PORT}")
+        scheme = "https" if handler.headers.get("X-Forwarded-Proto") == "https" else "http"
+        return f"{scheme}://{host}/integrations/google/callback"
+    return f"http://{HOST}:{PORT}/integrations/google/callback"
+
+
+def load_google_tokens() -> dict[str, dict[str, Any]]:
+    return read_json_file(GOOGLE_TOKENS_FILE, {})
+
+
+def save_google_tokens(tokens: dict[str, dict[str, Any]]) -> None:
+    write_json_file(GOOGLE_TOKENS_FILE, tokens)
+
+
+def google_state(uid: str) -> str:
+    issued_at = str(int(time.time()))
+    payload = f"{uid}:{issued_at}"
+    signature = hmac.new(SECRET, payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}:{signature}"
+
+
+def verify_google_state(state: str) -> str | None:
+    parts = state.split(":")
+    if len(parts) != 3:
+        return None
+    uid, issued_at, signature = parts
+    payload = f"{uid}:{issued_at}"
+    expected = hmac.new(SECRET, payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return None
+    try:
+        if int(time.time()) - int(issued_at) > 600:
+            return None
+    except ValueError:
+        return None
+    return uid
+
+
+def google_authorization_url(profile: dict[str, str], handler: BaseHTTPRequestHandler) -> str:
+    client_id = env("GOOGLE_CLIENT_ID")
+    if not client_id:
+        return ""
+    return goog.authorization_url(client_id, google_redirect_uri(handler), google_state(profile["uid"]))
+
+
+def exchange_google_code(code: str, redirect_uri: str) -> dict[str, Any]:
+    client_id = env("GOOGLE_CLIENT_ID")
+    client_secret = env("GOOGLE_CLIENT_SECRET")
+    if not (client_id and client_secret):
+        raise IntegrationError("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET are required for OAuth.")
+    return http_form_json(goog.GOOGLE_TOKEN_URL, goog.authorization_code_payload(client_id, client_secret, code, redirect_uri))
+
+
+def refresh_google_token(token: dict[str, Any]) -> dict[str, Any]:
+    client_id = env("GOOGLE_CLIENT_ID")
+    client_secret = env("GOOGLE_CLIENT_SECRET")
+    refresh_token = token.get("refresh_token")
+    if not (client_id and client_secret and refresh_token):
+        raise IntegrationError("Google token expired and no refresh token/client secret is available.")
+    response = http_form_json(goog.GOOGLE_TOKEN_URL, goog.refresh_token_payload(client_id, client_secret, refresh_token))
+    token.update(response)
+    token["refresh_token"] = refresh_token
+    token["expires_at"] = int(time.time()) + int(response.get("expires_in", 3600))
+    return token
+
+
+def stored_google_access_token(profile: dict[str, str] | None = None) -> tuple[str, str]:
+    env_token = env("GOOGLE_CALENDAR_ACCESS_TOKEN")
+    if env_token:
+        return env_token, "environment"
+    if not profile:
+        return "", ""
+    tokens = load_google_tokens()
+    token = tokens.get(profile["uid"])
+    if not token:
+        return "", ""
+    if int(token.get("expires_at", 0)) <= int(time.time()) + 60:
+        token = refresh_google_token(token)
+        tokens[profile["uid"]] = token
+        save_google_tokens(tokens)
+    return str(token.get("access_token", "")), "oauth"
+
+
 def get_plaid() -> dict[str, Any]:
     client_id = env("PLAID_CLIENT_ID")
     secret = env("PLAID_SECRET")
@@ -238,12 +352,15 @@ def get_plaid() -> dict[str, Any]:
     }
 
 
-def get_calendar_events() -> dict[str, Any]:
+def get_calendar_events(profile: dict[str, str] | None = None) -> dict[str, Any]:
     calendar_id = env("GOOGLE_CALENDAR_ID", "primary")
-    token = env("GOOGLE_CALENDAR_ACCESS_TOKEN")
+    try:
+        token, token_source = stored_google_access_token(profile)
+    except IntegrationError as error:
+        return {"connected": True, "events": [], "error": str(error), "token_source": "oauth"}
     api_key = env("GOOGLE_CALENDAR_API_KEY")
     if not (token or api_key):
-        return {"connected": False, "events": [], "error": ""}
+        return {"connected": False, "events": [], "error": "", "token_source": ""}
 
     first, last = month_window()
     params = {
@@ -261,8 +378,8 @@ def get_calendar_events() -> dict[str, Any]:
     try:
         response = http_json(url, headers=headers)
     except IntegrationError as error:
-        return {"connected": True, "events": [], "error": str(error)}
-    return {"connected": True, "events": response.get("items", []), "error": ""}
+        return {"connected": True, "events": [], "error": str(error), "token_source": token_source or "api_key"}
+    return {"connected": True, "events": response.get("items", []), "error": "", "token_source": token_source or "api_key"}
 
 
 def get_generic_endpoint(name: str, url_var: str, token_var: str = "") -> dict[str, Any]:
@@ -299,10 +416,10 @@ def get_weather() -> dict[str, Any]:
     return {"connected": True, "period": periods[0] if periods else None, "error": ""}
 
 
-def all_integrations() -> dict[str, Any]:
+def all_integrations(profile: dict[str, str] | None = None) -> dict[str, Any]:
     return {
         "plaid": get_plaid(),
-        "calendar": get_calendar_events(),
+        "calendar": get_calendar_events(profile),
         "school": get_generic_endpoint("School", "SCHOOL_EVENTS_URL", "SCHOOL_API_TOKEN"),
         "health": get_generic_endpoint("Health", "HEALTH_EVENTS_URL", "HEALTH_API_TOKEN"),
         "logistics": get_generic_endpoint("Logistics", "LOGISTICS_EVENTS_URL", "LOGISTICS_API_TOKEN"),
@@ -375,6 +492,7 @@ def layout(title: str, body: str, profile: dict[str, str] | None = None, active:
     first_name = profile.get("displayName", "Member").split()[0]
     nav = [
         ("/", "Home", "H"),
+        ("/assistant", "Assistant", "A"),
         ("/calendar", "Calendar", "C"),
         ("/finance", "Finance", "F"),
         ("/logistics", "Logistics", "L"),
@@ -387,11 +505,24 @@ def layout(title: str, body: str, profile: dict[str, str] | None = None, active:
     )
     family = get_generic_endpoint("Family", "FAMILY_MEMBERS_URL", "FAMILY_API_TOKEN")
     family_count = len(family.get("items", [])) if family.get("connected") and not family.get("error") else 0
-    chat_content = (
-        empty_state("Family chat not connected", "Set FAMILY_MEMBERS_URL or wire a messaging endpoint to populate this panel.", ["FAMILY_MEMBERS_URL"])
-        if family_count == 0
-        else f'<p class="muted-copy">{family_count} family profiles connected.</p>'
-    )
+    assistant_widget = """
+    <section class="assistant-widget" aria-label="AI assistant widget">
+      <button class="assistant-fab" type="button" aria-label="Open AI assistant" aria-expanded="false">A</button>
+      <div class="assistant-popover" aria-hidden="true">
+        <div class="assistant-popover-head">
+          <div><strong>AI Assistant</strong><small>Ask across connected data</small></div>
+          <button class="assistant-close" type="button" aria-label="Close AI assistant">x</button>
+        </div>
+        <form class="assistant-mini" method="post" action="/assistant">
+          <label>Question<textarea name="question" placeholder="What needs my attention today?"></textarea></label>
+          <div class="button-row">
+            <button class="button primary" type="submit">Ask</button>
+            <a class="button muted" href="/assistant">Open full page</a>
+          </div>
+        </form>
+      </div>
+    </section>
+    """
     shell = f"""
     <div class="app-shell">
       <aside class="sidebar">
@@ -406,15 +537,12 @@ def layout(title: str, body: str, profile: dict[str, str] | None = None, active:
             {profile_image(profile)}
             <div><strong>Good morning, {esc(first_name)}</strong><small>API integrations live when configured</small></div>
           </div>
-          <a class="button primary small" href="/sync">Integration Status</a>
+          <a class="button primary small" href="/assistant">Assistant</a>
         </header>
         <div class="content">{body}</div>
       </main>
-      <aside class="chat">
-        <div class="chat-head"><strong>Family Panel</strong><span></span></div>
-        {chat_content}
-      </aside>
       <nav class="mobile-nav">{links}</nav>
+      {assistant_widget}
     </div>
     """
     return document(title, shell)
@@ -470,9 +598,139 @@ def auth_page(mode: str = "login") -> str:
     return document("Authentication", body)
 
 
-def home_page(profile: dict[str, str]) -> str:
+def assistant_context(profile: dict[str, str]) -> dict[str, Any]:
+    integrations = all_integrations(profile)
+    summary = finance_summary(integrations["plaid"])
+    events = integrations["calendar"].get("events", [])[:8]
+    school = integrations["school"].get("items", [])[:8]
+    health = integrations["health"].get("items", [])[:8]
+    logistics = integrations["logistics"].get("items", [])[:8]
+    p2p = integrations["p2p"].get("items", [])[:8]
+    weather = integrations["weather"].get("period")
+    return {
+        "profile": {
+            "displayName": profile.get("displayName"),
+            "email": profile.get("email"),
+            "familyCode": profile.get("familyCode"),
+        },
+        "integrations": {
+            name: {
+                "connected": data.get("connected", False),
+                "error": bool(data.get("error")),
+            }
+            for name, data in integrations.items()
+        },
+        "finance": {
+            "liquidity": summary["liquidity"],
+            "income": summary["income"],
+            "expenses": summary["expenses"],
+            "accountCount": len(summary["accounts"]),
+            "transactionCount": len(summary["transactions"]),
+            "topCategories": sorted(summary["categories"].items(), key=lambda item: item[1], reverse=True)[:5],
+        },
+        "calendar": [
+            {"summary": event.get("summary"), "start": event_start(event), "location": event.get("location")}
+            for event in events
+        ],
+        "school": school,
+        "health": health,
+        "logistics": logistics,
+        "p2p": p2p,
+        "weather": weather,
+    }
+
+
+def assistant_system_prompt() -> str:
+    return (
+        "You are Filiation's private family operations assistant. "
+        "Use only the provided app context. Be concise, practical, and explicit about missing integrations. "
+        "Do not invent family data, events, finances, or health details. If data is missing, say what needs to be connected."
+    )
+
+
+def assistant_fallback_answer(question: str, context: dict[str, Any]) -> str:
+    connected = [name for name, data in context["integrations"].items() if data["connected"] and not data["error"]]
+    missing = [name for name, data in context["integrations"].items() if not data["connected"]]
+    parts = []
+    if connected:
+        parts.append(f"Connected sources: {', '.join(connected)}.")
+    else:
+        parts.append("No live data sources are connected yet.")
+    if missing:
+        parts.append(f"To make the assistant useful, connect: {', '.join(missing[:5])}.")
+    finance = context["finance"]
+    if finance["accountCount"] or finance["transactionCount"]:
+        parts.append(f"Finance currently shows {finance['accountCount']} accounts and {finance['transactionCount']} transactions.")
+    if context["calendar"]:
+        parts.append(f"Calendar has {len(context['calendar'])} upcoming items in scope.")
+    if question.strip():
+        parts.append("Once an AI key is configured, I can answer that question with reasoning over this same context.")
+    parts.append("Set GEMINI_API_KEY to enable generated assistant responses.")
+    return " ".join(parts)
+
+
+def ask_assistant(profile: dict[str, str], question: str) -> tuple[str, bool]:
+    context = assistant_context(profile)
+    api_key = env("GEMINI_API_KEY")
+    if not api_key:
+        return assistant_fallback_answer(question, context), False
+    model = env("GEMINI_MODEL", goog.DEFAULT_GEMINI_MODEL)
+    user_prompt = (
+        f"Question: {question.strip() or 'What should this family pay attention to right now?'}\n\n"
+        f"App context JSON:\n{json.dumps(context, indent=2, default=str)}"
+    )
+    try:
+        response = http_json(
+            goog.gemini_generate_url(api_key, model),
+            "POST",
+            payload=goog.gemini_payload(assistant_system_prompt(), user_prompt),
+        )
+        answer = goog.extract_gemini_text(response)
+    except IntegrationError as error:
+        return f"The assistant API call failed: {error}", False
+    if not answer:
+        return "The assistant did not return text. Check the Gemini model and API key configuration.", False
+    return answer, True
+
+
+def assistant_page(profile: dict[str, str], question: str = "", answer: str = "", generated: bool = False) -> str:
+    context = assistant_context(profile)
+    connected_count = sum(1 for data in context["integrations"].values() if data["connected"] and not data["error"])
+    integration_rows = "".join(
+        f'<div class="list-row"><div><strong>{esc(name.title())}</strong><small>{"Connected" if data["connected"] else "Not configured"}</small></div><span class="status {"success" if data["connected"] and not data["error"] else "danger" if data["error"] else ""}">{"Error" if data["error"] else "OK" if data["connected"] else "Missing"}</span></div>'
+        for name, data in context["integrations"].items()
+    )
+    if not answer:
+        answer = assistant_fallback_answer("", context)
+    source = "Gemini" if generated else "Local readiness check"
+    body = f"""
+    <header class="page-title row-title"><div><h1>AI Assistant</h1><p>Ask questions across calendar, finance, logistics, school, health, P2P, weather, and family data.</p></div><span class="status {"success" if generated else ""}">{esc(source)}</span></header>
+    <div class="grid-12">
+      {card(f'''
+        <form class="form-stack" method="post" action="/assistant">
+          <label>Question<textarea name="question" placeholder="What needs my attention today?">{esc(question)}</textarea></label>
+          <button class="button primary" type="submit">Ask Assistant</button>
+        </form>
+      ''', 'col-8')}
+      {card(f'<h3>Assistant Readiness</h3><p class="metric">{connected_count}/{len(context["integrations"])}</p><p class="muted-copy">Live sources connected</p><div class="env-pills"><code>GEMINI_API_KEY</code><code>GEMINI_MODEL</code></div>', 'col-4')}
+      {card(f'<div class="split"><h2>Answer</h2><span class="status">{esc(source)}</span></div><div class="assistant-answer">{esc(answer).replace(chr(10), "<br>")}</div>', 'col-8')}
+      {card('<h3>Data Sources</h3>' + integration_rows, 'col-4')}
+    </div>
+    """
+    return layout("Assistant", body, profile, "/assistant")
+
+
+def google_connect_action(handler: BaseHTTPRequestHandler | None = None, profile: dict[str, str] | None = None) -> str:
+    if profile and handler and env("GOOGLE_CLIENT_ID"):
+        return '<a class="button muted small" href="/integrations/google/start">Connect Google</a>'
+    if not env("GOOGLE_CLIENT_ID"):
+        return '<div class="env-pills"><code>GOOGLE_CLIENT_ID</code><code>GOOGLE_CLIENT_SECRET</code></div>'
+    return ""
+
+
+def home_page(profile: dict[str, str], handler: BaseHTTPRequestHandler | None = None) -> str:
     first_name = profile.get("displayName", "Family").split()[0]
-    integrations = all_integrations()
+    integrations = all_integrations(profile)
     summary = finance_summary(integrations["plaid"])
     events = integrations["calendar"].get("events", [])
     school_items = integrations["school"].get("items", [])
@@ -581,8 +839,8 @@ def logistics_page(profile: dict[str, str]) -> str:
     return layout("Logistics", body, profile, "/logistics")
 
 
-def calendar_page(profile: dict[str, str]) -> str:
-    calendar_data = get_calendar_events()
+def calendar_page(profile: dict[str, str], handler: BaseHTTPRequestHandler | None = None) -> str:
+    calendar_data = get_calendar_events(profile)
     events = calendar_data.get("events", [])
     first, _ = month_window()
     days_in_month = calendar.monthrange(first.year, first.month)[1]
@@ -605,8 +863,9 @@ def calendar_page(profile: dict[str, str]) -> str:
         for event in events[:4]
     ) or empty_state("No calendar events", "Connect Google Calendar to populate this month.", ["GOOGLE_CALENDAR_ACCESS_TOKEN", "GOOGLE_CALENDAR_API_KEY"])
 
+    calendar_detail = "Connected through OAuth." if calendar_data.get("token_source") == "oauth" else "Calendar API configured."
     body = f"""
-    <header class="page-title row-title"><div><h1>{esc(first.strftime("%B %Y"))}</h1><p>{len(events)} live events loaded</p></div>{integration_card("Google Calendar", calendar_data.get("connected", False), "Calendar API configured.", calendar_data.get("error", ""))}</header>
+    <header class="page-title row-title"><div><h1>{esc(first.strftime("%B %Y"))}</h1><p>{len(events)} live events loaded</p></div>{integration_card("Google Calendar", calendar_data.get("connected", False), calendar_detail, calendar_data.get("error", ""), google_connect_action(handler, profile))}</header>
     <section class="calendar-grid">
       {"".join(f"<b>{day}</b>" for day in ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"])}
       {"".join(cells)}
@@ -619,10 +878,10 @@ def calendar_page(profile: dict[str, str]) -> str:
     return layout("Calendar", body, profile, "/calendar")
 
 
-def sync_page(profile: dict[str, str]) -> str:
-    integrations = all_integrations()
+def sync_page(profile: dict[str, str], handler: BaseHTTPRequestHandler | None = None) -> str:
+    integrations = all_integrations(profile)
     cards = "".join(
-        integration_card(label, data.get("connected", False), detail, data.get("error", ""))
+        integration_card(label, data.get("connected", False), detail, data.get("error", ""), google_connect_action(handler, profile) if label == "Google Calendar" else "")
         for label, detail, data in [
             ("Plaid", "Bank balances and transactions.", integrations["plaid"]),
             ("Google Calendar", "Family calendar events.", integrations["calendar"]),
@@ -681,9 +940,11 @@ def settings_page(profile: dict[str, str], saved: bool = False) -> str:
 CSS = r"""
 :root{--primary:#4f46e5;--primary-2:#6366f1;--secondary:#10b981;--danger:#e11d48;--base:#f1f5f9;--low:#f8fafc;--ink:#0f172a}
 *{box-sizing:border-box}body{margin:0;background:var(--base);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}a{color:inherit;text-decoration:none}button,input,textarea{font:inherit}button{cursor:pointer}code{background:#eef2ff;color:#4338ca;border-radius:.5rem;padding:.3rem .45rem;font-size:.72rem}
-.app-shell{min-height:100vh;display:grid;grid-template-columns:16rem minmax(0,1fr)20rem}.sidebar,.chat,.topbar{background:white;border-color:#e2e8f0}.sidebar{position:sticky;top:0;height:100vh;padding:1.5rem;border-right:1px solid #e2e8f0}.brand{display:flex;align-items:center;gap:.75rem;margin-bottom:2rem;font-size:1.5rem}.brand-mark{display:grid;place-items:center;width:2.5rem;height:2.5rem;border-radius:.85rem;background:var(--primary);color:white;font-weight:900}.nav-list{display:flex;flex-direction:column;gap:.25rem}.nav-item{width:100%;border:0;background:transparent;display:flex;align-items:center;gap:.75rem;padding:.75rem 1rem;border-radius:.85rem;color:#475569;font-weight:800}.nav-item.active,.nav-item:hover{background:#eef2ff;color:var(--primary)}.nav-item.danger{color:var(--danger);margin-top:1rem}.family-pill{margin-top:2rem;padding:1rem;border-radius:1rem;background:#f8fafc;color:#64748b;font-size:.75rem}.main{min-width:0}.topbar{height:4rem;position:sticky;top:0;z-index:2;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;justify-content:space-between;padding:0 2rem}.user-chip{display:flex;align-items:center;gap:.75rem}.user-chip img,.avatar-fallback{width:2.5rem;height:2.5rem;object-fit:cover;border-radius:999px}.avatar-fallback{display:grid;place-items:center;background:#eef2ff;color:var(--primary);font-weight:950}.user-chip small{display:block;color:var(--secondary);font-size:.65rem;text-transform:uppercase;font-weight:900;letter-spacing:.08em}.content{padding:2rem;max-width:88rem}.chat{position:sticky;top:0;height:100vh;border-left:1px solid #e2e8f0;padding:2rem;display:flex;flex-direction:column;gap:1rem}.chat-head{display:flex;justify-content:space-between}.chat-head span{width:.5rem;height:.5rem;background:var(--secondary);border-radius:999px}.mobile-nav{display:none}
+.app-shell{min-height:100vh;display:grid;grid-template-columns:16rem minmax(0,1fr)}.sidebar,.topbar{background:white;border-color:#e2e8f0}.sidebar{position:sticky;top:0;height:100vh;padding:1.5rem;border-right:1px solid #e2e8f0}.brand{display:flex;align-items:center;gap:.75rem;margin-bottom:2rem;font-size:1.5rem}.brand-mark{display:grid;place-items:center;width:2.5rem;height:2.5rem;border-radius:.85rem;background:var(--primary);color:white;font-weight:900}.nav-list{display:flex;flex-direction:column;gap:.25rem}.nav-item{width:100%;border:0;background:transparent;display:flex;align-items:center;gap:.75rem;padding:.75rem 1rem;border-radius:.85rem;color:#475569;font-weight:800}.nav-item.active,.nav-item:hover{background:#eef2ff;color:var(--primary)}.nav-item.danger{color:var(--danger);margin-top:1rem}.family-pill{margin-top:2rem;padding:1rem;border-radius:1rem;background:#f8fafc;color:#64748b;font-size:.75rem}.main{min-width:0}.topbar{height:4rem;position:sticky;top:0;z-index:2;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;justify-content:space-between;padding:0 2rem}.user-chip{display:flex;align-items:center;gap:.75rem}.user-chip img,.avatar-fallback{width:2.5rem;height:2.5rem;object-fit:cover;border-radius:999px}.avatar-fallback{display:grid;place-items:center;background:#eef2ff;color:var(--primary);font-weight:950}.user-chip small{display:block;color:var(--secondary);font-size:.65rem;text-transform:uppercase;font-weight:900;letter-spacing:.08em}.content{padding:2rem;max-width:88rem}.mobile-nav{display:none}
 .page-title{margin-bottom:2rem}.page-title h1{font-size:clamp(2.35rem,5vw,4rem);line-height:.96;margin:.2rem 0;font-weight:950;letter-spacing:0}.page-title p,.muted-copy{font-size:1.05rem;color:#64748b;font-weight:650}.row-title,.split{display:flex;align-items:center;justify-content:space-between;gap:1rem}.button-row{display:flex;gap:.75rem;flex-wrap:wrap}.button{border:0;border-radius:1rem;padding:.9rem 1.25rem;font-weight:900;transition:.2s;display:inline-block}.button.primary{background:var(--primary);color:white;box-shadow:0 12px 28px rgba(79,70,229,.22)}.button.light{background:white;color:var(--primary)}.button.ghost{background:rgba(255,255,255,.18);color:white}.button.muted{background:#f1f5f9;color:#64748b}.button.dark{background:#0f172a;color:white}.button.small{padding:.55rem .9rem;font-size:.8rem}.button.full{width:100%;text-align:center}.card{background:white;border:1px solid #e2e8f0;border-radius:1.5rem;padding:2rem;box-shadow:0 1px 3px rgba(15,23,42,.08)}.dashboard-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1.5rem}.grid-12{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:1.5rem}.span-3{grid-column:span 3}.span-2{grid-column:span 2}.col-4{grid-column:span 4}.col-8{grid-column:span 8}.col-12{grid-column:span 12}.stack{display:flex;flex-direction:column;gap:1.5rem}.hero{background:linear-gradient(135deg,var(--primary),var(--primary-2));color:white;min-height:18rem;display:flex;flex-direction:column;justify-content:space-between;overflow:hidden}.hero h2{font-size:clamp(2rem,4vw,3.25rem);line-height:1.05;margin:.75rem 0}.hero p{color:rgba(255,255,255,.76)}.eyebrow,.status{display:inline-block;border-radius:999px;background:rgba(79,70,229,.1);color:var(--primary);font-size:.65rem;text-transform:uppercase;letter-spacing:.14em;font-weight:950;padding:.4rem .7rem}.status.success{background:#ecfdf5;color:#059669}.status.danger{background:#fff1f2;color:var(--danger)}.hero .eyebrow{background:rgba(255,255,255,.2);color:white}.metric,.big-number{font-size:3.2rem;font-weight:950;margin:.6rem 0}.round-icon,.request-icon{display:grid;place-items:center;width:3rem;height:3rem;border-radius:1rem;background:#eef2ff;color:var(--primary);font-weight:950}.alert-row,.list-row{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:1rem;border-radius:1rem;background:#f8fafc;margin-top:.75rem}.alert-row small,.list-row small,.vault small,.mini-card small{display:block;color:#94a3b8;font-size:.7rem;text-transform:uppercase;font-weight:900;letter-spacing:.08em}.center{text-align:center}.weather,.sync-cloud{font-size:2.8rem;font-weight:950}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;border-top:1px solid #e2e8f0;margin-top:2rem;padding-top:2rem}.stats span{color:#94a3b8;text-transform:uppercase;font-size:.7rem;font-weight:900}.stats b{display:block;color:var(--ink);font-size:1.4rem;text-transform:none}.info-box,.success-box,.empty-state{padding:1rem;border-radius:1rem;background:#eef2ff;color:#4338ca;font-weight:750}.empty-state{background:#f8fafc;color:#64748b;border:1px dashed #cbd5e1}.empty-state h3{margin:.1rem 0;color:#334155}.env-pills{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.75rem}.integration-card{background:#f8fafc;border:1px solid #e2e8f0;border-radius:1rem;padding:1rem;margin:.75rem 0}.integration-card p{color:#64748b;font-size:.85rem;margin:.5rem 0 0}.vault{background:#f8fafc;border-radius:1rem;padding:1rem;margin-top:1rem}.vault p{font-size:1.4rem;font-weight:950;margin:.5rem 0}.dark{background:#0f172a;color:white}.dark p{color:rgba(255,255,255,.68)}.dark .integration-card{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.12)}.timeline-item{display:flex;gap:1rem;margin:1.25rem 0}.timeline-item>span{width:1rem;height:1rem;background:var(--primary);border-radius:999px;margin-top:.35rem;box-shadow:0 0 0 .25rem white}.timeline-item small{color:var(--primary);font-size:.7rem;text-transform:uppercase;font-weight:950;letter-spacing:.08em}.timeline-item h3{margin:.15rem 0}.timeline-item p{color:#64748b;margin:.25rem 0}.mini-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1rem}.mini-card{background:#f8fafc}.calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:1rem;margin-bottom:2rem}.calendar-grid>b{text-align:center;color:#94a3b8;text-transform:uppercase;font-size:.7rem;letter-spacing:.16em}.calendar-cell{min-height:7rem;border-radius:1.2rem;background:white;border:1px solid #e2e8f0;padding:1rem}.calendar-cell.today{background:var(--primary);color:white}.calendar-cell.empty{background:rgba(248,250,252,.6);border:0}.calendar-cell small{display:block;margin-top:.6rem;color:#047857;background:#ecfdf5;border-radius:.5rem;padding:.25rem;font-size:.65rem;font-weight:900}.bar-list{list-style:none;padding:0;margin:1rem 0}.bar-list li{margin:.85rem 0}.bar-list span{display:block;height:.5rem;min-width:.3rem;background:var(--primary);border-radius:999px;margin-bottom:.35rem}.bar-list div{display:flex;justify-content:space-between;gap:.75rem;color:#64748b;font-weight:800}.node-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin:2rem 0}.node-grid span{color:rgba(255,255,255,.45);font-size:.7rem;text-transform:uppercase;font-weight:900}.node-grid b{display:block;color:white;font-size:2rem;text-transform:none}.node-grid small{display:block;color:#34d399}.profile-photo{display:grid;place-items:center}.profile-photo img,.profile-photo .avatar-fallback{width:8rem;height:8rem;border-radius:999px}.settings-grid label,.auth-card label{display:flex;flex-direction:column;gap:.45rem;color:#64748b;text-transform:uppercase;letter-spacing:.08em;font-size:.7rem;font-weight:950}.settings-grid input,.settings-grid textarea,.auth-card input{border:0;background:#f8fafc;border-radius:1rem;padding:1rem;color:var(--ink);text-transform:none;letter-spacing:0}.settings-grid textarea{min-height:8rem;resize:vertical}.field-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}.success-inline{color:#059669;font-weight:900}.auth-page{min-height:100vh;display:grid;grid-template-columns:1fr 1.35fr;gap:4rem;align-items:center;padding:4rem;max-width:90rem;margin:auto}.auth-copy h1{font-size:clamp(3rem,7vw,5.4rem);line-height:.9;margin:3rem 0 1.5rem;font-weight:950}.auth-copy p{font-size:1.2rem;color:#64748b;max-width:34rem}.feature-row{display:flex;gap:1rem;flex-wrap:wrap;margin-top:3rem}.feature-row span{background:white;border-radius:1rem;padding:1rem;font-weight:900}.auth-card{background:white;border-radius:2rem;padding:2rem;box-shadow:0 12px 36px rgba(15,23,42,.1)}.mode-tabs{display:inline-flex;background:#f8fafc;border-radius:999px;padding:.35rem;margin-bottom:2rem}.mode-tabs a{padding:.8rem 2rem;border-radius:999px;font-weight:950;color:#94a3b8}.mode-tabs a.active{background:white;color:var(--primary);box-shadow:0 1px 3px rgba(15,23,42,.12)}.auth-grid{display:grid;grid-template-columns:1fr 1fr;gap:2rem}.form-stack{display:flex;flex-direction:column;gap:1rem}.onboarding{background:#f8fafc;border-radius:1.5rem;padding:1.5rem}
-@media(max-width:1200px){.app-shell{grid-template-columns:16rem minmax(0,1fr)}.chat{display:none}.dashboard-grid{grid-template-columns:repeat(2,1fr)}.span-3,.span-2{grid-column:span 2}}@media(max-width:760px){.app-shell{display:block}.sidebar{display:none}.topbar{padding:0 1rem}.content{padding:1rem 1rem 6rem}.mobile-nav{display:flex;position:fixed;bottom:0;left:0;right:0;background:white;border-top:1px solid #e2e8f0;justify-content:space-around;padding:.5rem;z-index:5}.mobile-nav .nav-item{font-size:.7rem;flex-direction:column;gap:.2rem;padding:.45rem}.dashboard-grid,.grid-12,.auth-page,.auth-grid,.field-grid,.mini-grid{grid-template-columns:1fr}.col-4,.col-8,.col-12,.span-3,.span-2{grid-column:auto}.row-title,.split{align-items:flex-start;flex-direction:column}.calendar-grid{gap:.35rem}.calendar-cell{min-height:5rem;padding:.5rem;border-radius:.8rem}.auth-page{padding:1rem}.auth-copy h1{margin:1.5rem 0;font-size:3rem}.node-grid,.stats{grid-template-columns:1fr}}
+.form-stack label,.assistant-mini label{display:flex;flex-direction:column;gap:.45rem;color:#64748b;text-transform:uppercase;letter-spacing:.08em;font-size:.7rem;font-weight:950}.form-stack textarea,.assistant-mini textarea{border:0;background:#f8fafc;border-radius:1rem;padding:1rem;color:var(--ink);text-transform:none;letter-spacing:0;resize:vertical}.form-stack textarea{min-height:9rem}.assistant-mini{display:flex;flex-direction:column;gap:1rem}.assistant-mini textarea{min-height:8rem}.assistant-answer{color:#334155;font-size:1rem;line-height:1.65}
+.assistant-widget{position:fixed;right:1.5rem;bottom:1.5rem;z-index:20}.assistant-fab{width:4rem;height:4rem;border:0;border-radius:999px;background:var(--primary);color:white;font-weight:950;font-size:1.25rem;box-shadow:0 18px 38px rgba(79,70,229,.34)}.assistant-popover{position:absolute;right:0;bottom:5rem;width:min(24rem,calc(100vw - 2rem));background:white;border:1px solid #e2e8f0;border-radius:1.5rem;padding:1rem;box-shadow:0 24px 60px rgba(15,23,42,.18);display:none}.assistant-widget.open .assistant-popover{display:block}.assistant-popover-head{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;margin-bottom:1rem}.assistant-popover-head small{display:block;color:#64748b;font-size:.72rem;text-transform:uppercase;font-weight:900;letter-spacing:.08em}.assistant-close{border:0;background:#f1f5f9;color:#64748b;width:2rem;height:2rem;border-radius:999px;font-weight:900}.assistant-popover .assistant-mini textarea{min-height:7rem}.assistant-popover .button-row{justify-content:space-between}
+@media(max-width:1200px){.dashboard-grid{grid-template-columns:repeat(2,1fr)}.span-3,.span-2{grid-column:span 2}}@media(max-width:760px){.app-shell{display:block}.sidebar{display:none}.topbar{padding:0 1rem}.content{padding:1rem 1rem 6rem}.mobile-nav{display:flex;position:fixed;bottom:0;left:0;right:0;background:white;border-top:1px solid #e2e8f0;justify-content:space-around;padding:.5rem;z-index:5}.mobile-nav .nav-item{font-size:.7rem;flex-direction:column;gap:.2rem;padding:.45rem}.assistant-widget{right:1rem;bottom:5.5rem}.assistant-fab{width:3.5rem;height:3.5rem}.dashboard-grid,.grid-12,.auth-page,.auth-grid,.field-grid,.mini-grid{grid-template-columns:1fr}.col-4,.col-8,.col-12,.span-3,.span-2{grid-column:auto}.row-title,.split{align-items:flex-start;flex-direction:column}.calendar-grid{gap:.35rem}.calendar-cell{min-height:5rem;padding:.5rem;border-radius:.8rem}.auth-page{padding:1rem}.auth-copy h1{margin:1.5rem 0;font-size:3rem}.node-grid,.stats{grid-template-columns:1fr}}
 """
 
 
@@ -708,6 +969,25 @@ if (notifyButton) {
     if (permission === "granted") {
       new Notification("Filiation notifications enabled", { body: "Browser alerts are now enabled for this device." });
     }
+  });
+}
+const assistantWidget = document.querySelector(".assistant-widget");
+if (assistantWidget) {
+  const assistantFab = assistantWidget.querySelector(".assistant-fab");
+  const assistantClose = assistantWidget.querySelector(".assistant-close");
+  const assistantPopover = assistantWidget.querySelector(".assistant-popover");
+  const setAssistantOpen = (open) => {
+    assistantWidget.classList.toggle("open", open);
+    assistantFab?.setAttribute("aria-expanded", open ? "true" : "false");
+    assistantPopover?.setAttribute("aria-hidden", open ? "false" : "true");
+    if (open) {
+      assistantWidget.querySelector("textarea")?.focus();
+    }
+  };
+  assistantFab?.addEventListener("click", () => setAssistantOpen(!assistantWidget.classList.contains("open")));
+  assistantClose?.addEventListener("click", () => setAssistantOpen(false));
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") setAssistantOpen(false);
   });
 }
 """
@@ -754,8 +1034,59 @@ class FiliationHandler(BaseHTTPRequestHandler):
         if not profile:
             return
 
+        if path == "/integrations/google/start":
+            authorization_url = google_authorization_url(profile, self)
+            if not authorization_url:
+                self.send_html(
+                    layout(
+                        "Google Calendar",
+                        card(
+                            empty_state(
+                                "Google OAuth is not configured",
+                                "Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET, then restart the app.",
+                                ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"],
+                            )
+                        ),
+                        profile,
+                        "/sync",
+                    ),
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            self.redirect(authorization_url)
+            return
+
+        if path == "/integrations/google/callback":
+            code = query.get("code", [""])[0]
+            state = query.get("state", [""])[0]
+            state_uid = verify_google_state(state)
+            if not code or state_uid != profile["uid"]:
+                self.send_html(
+                    layout("Google Calendar", card(empty_state("Google authorization failed", "The OAuth callback was missing a valid code or state.", [])), profile, "/sync"),
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            try:
+                token = exchange_google_code(code, google_redirect_uri(self))
+            except IntegrationError as error:
+                self.send_html(
+                    layout("Google Calendar", card(empty_state("Google token exchange failed", str(error), ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"])), profile, "/sync"),
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return
+            tokens = load_google_tokens()
+            existing_refresh = tokens.get(profile["uid"], {}).get("refresh_token")
+            if existing_refresh and "refresh_token" not in token:
+                token["refresh_token"] = existing_refresh
+            token["expires_at"] = int(time.time()) + int(token.get("expires_in", 3600))
+            tokens[profile["uid"]] = token
+            save_google_tokens(tokens)
+            self.redirect("/sync")
+            return
+
         routes = {
             "/": home_page,
+            "/assistant": assistant_page,
             "/finance": finance_page,
             "/logistics": logistics_page,
             "/calendar": calendar_page,
@@ -766,7 +1097,10 @@ class FiliationHandler(BaseHTTPRequestHandler):
         if not page:
             self.redirect("/")
             return
-        self.send_html(page(profile))
+        if path in {"/", "/calendar", "/sync"}:
+            self.send_html(page(profile, self))
+        else:
+            self.send_html(page(profile))
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -803,6 +1137,16 @@ class FiliationHandler(BaseHTTPRequestHandler):
                 users[uid][key] = data.get(key, "")
             save_users(users)
             self.send_html(settings_page(users[uid], saved=True))
+            return
+
+        if path == "/assistant":
+            profile = self.require_profile()
+            if not profile:
+                return
+            data = read_form(self)
+            question = data.get("question", "")
+            answer, generated = ask_assistant(profile, question)
+            self.send_html(assistant_page(profile, question, answer, generated))
             return
 
         self.redirect("/")

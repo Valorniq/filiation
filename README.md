@@ -39,6 +39,13 @@ Optional environment variables:
 - `FILIATION_DATA_DIR`: change where local profile data is stored
 - `FILIATION_API_TIMEOUT`: request timeout for provider calls, default `8`
 
+### AI assistant
+
+The Assistant page can answer questions across connected finance, calendar, school, health, logistics, P2P, weather, and family data. Without an AI key it falls back to a local readiness summary.
+
+- `GEMINI_API_KEY`: enables generated assistant answers
+- `GEMINI_MODEL`: optional, default `gemini-1.5-flash`
+
 ### API integrations
 
 Finance uses Plaid:
@@ -51,9 +58,14 @@ Finance uses Plaid:
 
 Calendar uses Google Calendar:
 
+- `GOOGLE_CLIENT_ID`: OAuth client ID for the built-in Connect Google flow
+- `GOOGLE_CLIENT_SECRET`: OAuth client secret for the built-in Connect Google flow
+- `GOOGLE_REDIRECT_URI`: optional callback URL, default `http://127.0.0.1:3000/integrations/google/callback`
 - `GOOGLE_CALENDAR_ID`: default `primary`
-- `GOOGLE_CALENDAR_ACCESS_TOKEN`: for private calendars
+- `GOOGLE_CALENDAR_ACCESS_TOKEN`: optional direct token for private calendars
 - `GOOGLE_CALENDAR_API_KEY`: for public calendars
+
+For local OAuth, add the redirect URI above to your Google Cloud OAuth client, start the app, sign in locally, then use `Connect Google` from Calendar or Sync. Refresh tokens are stored in `FILIATION_DATA_DIR/google_tokens.json`, which is ignored by git.
 
 Weather uses the National Weather Service:
 
