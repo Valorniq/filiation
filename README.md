@@ -19,9 +19,9 @@ View your app in AI Studio: https://ai.studio/apps/85889949-8052-4fb9-b823-096ee
 3. Run the app:
    `npm run dev`
 
-## Python translation
+## Python API-backed app
 
-This repository also includes a standard-library Python translation in [app.py](app.py). It preserves the same protected app sections, local profile editing, dashboard data, sync action, and notification prompts without requiring Node.js or Firebase credentials.
+This repository also includes a standard-library Python app in [app.py](app.py). It keeps the dashboard, auth shell, profile editing, sync status, and notification prompts, but it no longer ships with fake dashboard records. App pages read from configured APIs and show connection states until credentials or endpoint URLs are provided.
 
 Run it with:
 
@@ -37,3 +37,33 @@ Optional environment variables:
 - `HOST`: change the bind host
 - `FILIATION_SECRET`: set a stronger local session-signing secret
 - `FILIATION_DATA_DIR`: change where local profile data is stored
+- `FILIATION_API_TIMEOUT`: request timeout for provider calls, default `8`
+
+### API integrations
+
+Finance uses Plaid:
+
+- `PLAID_ENV`: `sandbox`, `development`, or `production`
+- `PLAID_CLIENT_ID`
+- `PLAID_SECRET`
+- `PLAID_ACCESS_TOKEN`
+- `PLAID_TRANSACTION_COUNT`: optional, default `50`
+
+Calendar uses Google Calendar:
+
+- `GOOGLE_CALENDAR_ID`: default `primary`
+- `GOOGLE_CALENDAR_ACCESS_TOKEN`: for private calendars
+- `GOOGLE_CALENDAR_API_KEY`: for public calendars
+
+Weather uses the National Weather Service:
+
+- `FILIATION_LAT`
+- `FILIATION_LON`
+
+School, health, logistics, P2P requests, and family members use generic JSON endpoints. Each endpoint can return either a list or an object with `items`, `data`, or `results`.
+
+- `SCHOOL_EVENTS_URL` and optional `SCHOOL_API_TOKEN`
+- `HEALTH_EVENTS_URL` and optional `HEALTH_API_TOKEN`
+- `LOGISTICS_EVENTS_URL` and optional `LOGISTICS_API_TOKEN`
+- `P2P_REQUESTS_URL` and optional `P2P_API_TOKEN`
+- `FAMILY_MEMBERS_URL` and optional `FAMILY_API_TOKEN`
