@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+import csv
 import datetime as dt
 import hashlib
 import hmac
@@ -44,6 +45,45 @@ DATA_DIR = Path(os.environ.get("FILIATION_DATA_DIR", "data"))
 USERS_FILE = DATA_DIR / "users.json"
 GOOGLE_TOKENS_FILE = DATA_DIR / "google_tokens.json"
 API_TIMEOUT = float(os.environ.get("FILIATION_API_TIMEOUT", "8"))
+LOCAL_ENV_FILE = Path(".env.local")
+
+SETUP_FIELDS = {
+    "GEMINI_API_KEY",
+    "GEMINI_MODEL",
+    "FINANCE_PROVIDER",
+    "BANK_ACCOUNTS_FILE",
+    "BANK_TRANSACTIONS_FILE",
+    "FINANCE_DATA_URL",
+    "FINANCE_API_TOKEN",
+    "PLAID_ENV",
+    "PLAID_CLIENT_ID",
+    "PLAID_SECRET",
+    "PLAID_ACCESS_TOKEN",
+    "PLAID_TRANSACTION_COUNT",
+    "GOOGLE_CLIENT_ID",
+    "GOOGLE_CLIENT_SECRET",
+    "GOOGLE_REDIRECT_URI",
+    "GOOGLE_CALENDAR_ID",
+    "GOOGLE_CALENDAR_ACCESS_TOKEN",
+    "GOOGLE_CALENDAR_API_KEY",
+    "CALENDAR_PROVIDER",
+    "ICALENDAR_URL",
+    "ICALENDAR_FILE",
+    "ICALENDAR_API_TOKEN",
+    "FILIATION_LAT",
+    "FILIATION_LON",
+    "SCHOOL_PROVIDER",
+    "SCHOOL_EVENTS_URL",
+    "SCHOOL_API_TOKEN",
+    "HEALTH_EVENTS_URL",
+    "HEALTH_API_TOKEN",
+    "LOGISTICS_EVENTS_URL",
+    "LOGISTICS_API_TOKEN",
+    "P2P_REQUESTS_URL",
+    "P2P_API_TOKEN",
+    "FAMILY_MEMBERS_URL",
+    "FAMILY_API_TOKEN",
+}
 
 
 class IntegrationError(Exception):
@@ -52,6 +92,50 @@ class IntegrationError(Exception):
 
 def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
+
+
+def masked(value: str) -> str:
+    if not value:
+        return "Not saved"
+    if len(value) <= 8:
+        return "Saved"
+    return f"Saved, ends with {value[-4:]}"
+
+
+def clean_env_value(value: str) -> str:
+    return value.strip().replace("\r", "").replace("\n", " ")
+
+
+def write_local_env(updates: dict[str, str]) -> None:
+    clean_updates = {key: clean_env_value(value) for key, value in updates.items() if key in SETUP_FIELDS and clean_env_value(value)}
+    if not clean_updates:
+        return
+
+    existing_lines = LOCAL_ENV_FILE.read_text().splitlines() if LOCAL_ENV_FILE.exists() else []
+    seen: set[str] = set()
+    next_lines: list[str] = []
+    for line in existing_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            next_lines.append(line)
+            continue
+        key, _ = line.split("=", 1)
+        key = key.strip()
+        if key in clean_updates:
+            next_lines.append(f"{key}={clean_updates[key]}")
+            seen.add(key)
+            os.environ[key] = clean_updates[key]
+        else:
+            next_lines.append(line)
+
+    if next_lines and next_lines[-1].strip():
+        next_lines.append("")
+    for key, value in clean_updates.items():
+        if key not in seen:
+            next_lines.append(f"{key}={value}")
+            os.environ[key] = value
+
+    LOCAL_ENV_FILE.write_text("\n".join(next_lines).rstrip() + "\n")
 
 
 def esc(value: Any) -> str:
@@ -77,6 +161,26 @@ def read_json_file(path: Path, fallback: Any) -> Any:
         return json.loads(path.read_text())
     except json.JSONDecodeError:
         return fallback
+
+
+def read_local_records(path_value: str) -> list[dict[str, Any]]:
+    if not path_value:
+        return []
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if not path.exists():
+        raise IntegrationError(f"File not found: {path}")
+    if path.suffix.lower() == ".json":
+        data = json.loads(path.read_text())
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            items = data.get("items") or data.get("data") or data.get("results") or []
+            return [item for item in items if isinstance(item, dict)]
+        return []
+    with path.open(newline="") as csv_file:
+        return [dict(row) for row in csv.DictReader(csv_file)]
 
 
 def write_json_file(path: Path, data: Any) -> None:
@@ -352,7 +456,225 @@ def get_plaid() -> dict[str, Any]:
     }
 
 
-def get_calendar_events(profile: dict[str, str] | None = None) -> dict[str, Any]:
+def first_value(row: dict[str, Any], *keys: str, default: Any = "") -> Any:
+    lowered = {str(key).strip().lower(): value for key, value in row.items()}
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return value
+        value = lowered.get(key.lower())
+        if value not in (None, ""):
+            return value
+    return default
+
+
+def normalize_account(row: dict[str, Any]) -> dict[str, Any]:
+    balance = first_value(row, "balance", "current", "current_balance", "available_balance", default=0)
+    return {
+        "name": first_value(row, "name", "account", "account_name", default="Bank account"),
+        "official_name": first_value(row, "official_name", "institution", "bank", default="Local bank export"),
+        "subtype": first_value(row, "type", "subtype", default="account"),
+        "mask": first_value(row, "mask", "last4", "last_4", default=""),
+        "balances": {"current": balance, "available": balance},
+    }
+
+
+def normalize_transaction(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": first_value(row, "name", "merchant", "description", "payee", default="Transaction"),
+        "date": first_value(row, "date", "posted_date", "transaction_date", default=""),
+        "amount": first_value(row, "amount", "debit", "credit", default=0),
+        "category": [first_value(row, "category", "type", default="Uncategorized")],
+    }
+
+
+def get_local_bank_files() -> dict[str, Any]:
+    accounts_file = env("BANK_ACCOUNTS_FILE")
+    transactions_file = env("BANK_TRANSACTIONS_FILE")
+    if not (accounts_file or transactions_file):
+        return {"connected": False, "accounts": [], "transactions": [], "error": "", "provider": "local_files"}
+    try:
+        accounts = [normalize_account(row) for row in read_local_records(accounts_file)] if accounts_file else []
+        transactions = [normalize_transaction(row) for row in read_local_records(transactions_file)] if transactions_file else []
+    except (IntegrationError, OSError, csv.Error, json.JSONDecodeError) as error:
+        return {"connected": True, "accounts": [], "transactions": [], "error": str(error), "provider": "local_files"}
+    return {"connected": True, "accounts": accounts, "transactions": transactions, "error": "", "provider": "local_files"}
+
+
+def get_finance_json_endpoint(provider: str = "json") -> dict[str, Any]:
+    url = env("FINANCE_DATA_URL")
+    if not url:
+        return {"connected": False, "accounts": [], "transactions": [], "error": "", "provider": provider}
+    token = env("FINANCE_API_TOKEN")
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        response = http_json(url, headers=headers)
+    except IntegrationError as error:
+        return {"connected": True, "accounts": [], "transactions": [], "error": str(error), "provider": provider}
+    accounts = response.get("accounts", []) if isinstance(response, dict) else []
+    transactions = response.get("transactions", []) if isinstance(response, dict) else []
+    return {
+        "connected": True,
+        "accounts": [normalize_account(row) for row in accounts if isinstance(row, dict)],
+        "transactions": [normalize_transaction(row) for row in transactions if isinstance(row, dict)],
+        "error": "",
+        "provider": provider,
+    }
+
+
+def get_finance() -> dict[str, Any]:
+    provider = env("FINANCE_PROVIDER", "local").lower()
+    if provider == "plaid":
+        result = get_plaid()
+        result["provider"] = "plaid"
+        return result
+    if provider == "json":
+        return get_finance_json_endpoint()
+    if env("FINANCE_DATA_URL"):
+        return get_finance_json_endpoint("direct")
+    result = get_local_bank_files()
+    result["provider"] = "direct"
+    return result
+
+
+def get_school() -> dict[str, Any]:
+    provider = env("SCHOOL_PROVIDER", "custom_json")
+    result = get_generic_endpoint("School", "SCHOOL_EVENTS_URL", "SCHOOL_API_TOKEN")
+    result["provider"] = provider
+    return result
+
+
+def create_plaid_sandbox_access_token() -> str:
+    client_id = env("PLAID_CLIENT_ID")
+    secret = env("PLAID_SECRET")
+    if not (client_id and secret):
+        raise IntegrationError("Add your Plaid client ID and sandbox secret first.")
+    payload = {
+        "client_id": client_id,
+        "secret": secret,
+        "institution_id": "ins_109508",
+        "initial_products": ["transactions"],
+        "options": {"override_username": "user_good", "override_password": "pass_good"},
+    }
+    public_token = http_json("https://sandbox.plaid.com/sandbox/public_token/create", "POST", payload=payload).get("public_token")
+    if not public_token:
+        raise IntegrationError("Plaid did not return a sandbox public token.")
+    exchange = http_json(
+        "https://sandbox.plaid.com/item/public_token/exchange",
+        "POST",
+        payload={"client_id": client_id, "secret": secret, "public_token": public_token},
+    )
+    access_token = exchange.get("access_token")
+    if not access_token:
+        raise IntegrationError("Plaid did not return an access token.")
+    write_local_env({"FINANCE_PROVIDER": "plaid", "PLAID_ENV": "sandbox", "PLAID_ACCESS_TOKEN": access_token})
+    return str(access_token)
+
+
+def provider_label(value: str) -> str:
+    labels = {
+        "direct": "Direct",
+        "local": "Direct",
+        "local_files": "Direct",
+        "json": "Custom API",
+        "plaid": "Plaid",
+        "auto": "Auto-detect",
+        "icalendar": "iCalendar",
+        "ical": "iCalendar",
+        "ics": "iCalendar",
+        "google": "Google Calendar",
+        "infinite_campus": "Infinite Campus",
+        "schoology": "Schoology",
+        "canvas": "Canvas",
+        "custom_json": "Custom JSON",
+    }
+    return labels.get(value, value.replace("_", " ").title())
+
+
+def unfold_ical_lines(raw: str) -> list[str]:
+    lines: list[str] = []
+    for line in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if line.startswith((" ", "\t")) and lines:
+            lines[-1] += line[1:]
+        elif line:
+            lines.append(line)
+    return lines
+
+
+def parse_ical_value(line: str) -> tuple[str, str]:
+    key, _, value = line.partition(":")
+    return key.split(";", 1)[0].upper(), value
+
+
+def decode_ical_text(value: str) -> str:
+    return value.replace("\\n", "\n").replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
+
+
+def ical_to_google_datetime(value: str) -> dict[str, str]:
+    clean = value.strip()
+    if not clean:
+        return {}
+    if len(clean) == 8 and clean.isdigit():
+        return {"date": f"{clean[:4]}-{clean[4:6]}-{clean[6:8]}"}
+    if clean.endswith("Z"):
+        clean = clean[:-1] + "Z"
+    if "T" in clean and len(clean) >= 15:
+        return {"dateTime": f"{clean[:4]}-{clean[4:6]}-{clean[6:8]}T{clean[9:11]}:{clean[11:13]}:{clean[13:15]}{'Z' if clean.endswith('Z') else ''}"}
+    return {"dateTime": clean}
+
+
+def parse_ical_events(raw: str) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for line in unfold_ical_lines(raw):
+        key, value = parse_ical_value(line)
+        if key == "BEGIN" and value.upper() == "VEVENT":
+            current = {}
+            continue
+        if key == "END" and value.upper() == "VEVENT":
+            if current:
+                events.append(current)
+            current = None
+            continue
+        if current is None:
+            continue
+        if key == "SUMMARY":
+            current["summary"] = decode_ical_text(value)
+        elif key == "DESCRIPTION":
+            current["description"] = decode_ical_text(value)
+        elif key == "LOCATION":
+            current["location"] = decode_ical_text(value)
+        elif key == "DTSTART":
+            current["start"] = ical_to_google_datetime(value)
+        elif key == "DTEND":
+            current["end"] = ical_to_google_datetime(value)
+    return events
+
+
+def get_icalendar_events() -> dict[str, Any]:
+    ical_url = env("ICALENDAR_URL")
+    ical_file = env("ICALENDAR_FILE")
+    if not (ical_url or ical_file):
+        return {"connected": False, "events": [], "error": "", "token_source": "icalendar"}
+    try:
+        if ical_url:
+            token = env("ICALENDAR_API_TOKEN")
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            request = Request(ical_url, headers={"Accept": "text/calendar,*/*", "User-Agent": "Filiation/1.0", **headers})
+            with urlopen(request, timeout=API_TIMEOUT) as response:
+                raw = response.read().decode(errors="replace")
+        else:
+            path = Path(ical_file).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            raw = path.read_text()
+    except (OSError, HTTPError, URLError, TimeoutError) as error:
+        return {"connected": True, "events": [], "error": str(error), "token_source": "icalendar"}
+    events = parse_ical_events(raw)
+    return {"connected": True, "events": events, "error": "", "token_source": "icalendar"}
+
+
+def get_google_calendar_events(profile: dict[str, str] | None = None) -> dict[str, Any]:
     calendar_id = env("GOOGLE_CALENDAR_ID", "primary")
     try:
         token, token_source = stored_google_access_token(profile)
@@ -380,6 +702,18 @@ def get_calendar_events(profile: dict[str, str] | None = None) -> dict[str, Any]
     except IntegrationError as error:
         return {"connected": True, "events": [], "error": str(error), "token_source": token_source or "api_key"}
     return {"connected": True, "events": response.get("items", []), "error": "", "token_source": token_source or "api_key"}
+
+
+def get_calendar_events(profile: dict[str, str] | None = None) -> dict[str, Any]:
+    provider = env("CALENDAR_PROVIDER", "auto").lower()
+    if provider in {"ical", "ics", "icalendar"}:
+        return get_icalendar_events()
+    if provider == "google":
+        return get_google_calendar_events(profile)
+    ical = get_icalendar_events()
+    if ical.get("connected"):
+        return ical
+    return get_google_calendar_events(profile)
 
 
 def get_generic_endpoint(name: str, url_var: str, token_var: str = "") -> dict[str, Any]:
@@ -418,9 +752,9 @@ def get_weather() -> dict[str, Any]:
 
 def all_integrations(profile: dict[str, str] | None = None) -> dict[str, Any]:
     return {
-        "plaid": get_plaid(),
+        "finance": get_finance(),
         "calendar": get_calendar_events(profile),
-        "school": get_generic_endpoint("School", "SCHOOL_EVENTS_URL", "SCHOOL_API_TOKEN"),
+        "school": get_school(),
         "health": get_generic_endpoint("Health", "HEALTH_EVENTS_URL", "HEALTH_API_TOKEN"),
         "logistics": get_generic_endpoint("Logistics", "LOGISTICS_EVENTS_URL", "LOGISTICS_API_TOKEN"),
         "p2p": get_generic_endpoint("P2P", "P2P_REQUESTS_URL", "P2P_API_TOKEN"),
@@ -429,9 +763,9 @@ def all_integrations(profile: dict[str, str] | None = None) -> dict[str, Any]:
     }
 
 
-def finance_summary(plaid: dict[str, Any]) -> dict[str, Any]:
-    accounts = plaid.get("accounts", [])
-    transactions = plaid.get("transactions", [])
+def finance_summary(finance: dict[str, Any]) -> dict[str, Any]:
+    accounts = finance.get("accounts", [])
+    transactions = finance.get("transactions", [])
     liquidity = 0.0
     for account in accounts:
         balances = account.get("balances", {})
@@ -497,6 +831,7 @@ def layout(title: str, body: str, profile: dict[str, str] | None = None, active:
         ("/finance", "Finance", "F"),
         ("/logistics", "Logistics", "L"),
         ("/sync", "Sync", "S"),
+        ("/connections", "Setup", "K"),
         ("/settings", "Settings", "G"),
     ]
     links = "\n".join(
@@ -573,7 +908,7 @@ def auth_page(mode: str = "login") -> str:
         <a class="brand" href="/auth"><span class="brand-mark">R</span><strong>{APP_NAME}</strong></a>
         <h1>{heading}</h1>
         <p>{subcopy}</p>
-        <div class="feature-row"><span>Plaid</span><span>Google Calendar</span><span>School APIs</span><span>Weather.gov</span></div>
+        <div class="feature-row"><span>Direct Bank Files</span><span>Calendar Choice</span><span>School APIs</span><span>Weather.gov</span></div>
       </section>
       <section class="auth-card">
         <div class="mode-tabs"><a class="{"active" if not is_register else ""}" href="/auth">Login</a><a class="{"active" if is_register else ""}" href="/auth?mode=register">Register</a></div>
@@ -589,7 +924,7 @@ def auth_page(mode: str = "login") -> str:
           <div class="onboarding">
             <h2>Connect APIs</h2>
             <p>Use the environment variables in the README to enable live data. Until then, pages show empty states.</p>
-            <div class="env-pills"><code>PLAID_ACCESS_TOKEN</code><code>GOOGLE_CALENDAR_ACCESS_TOKEN</code><code>SCHOOL_EVENTS_URL</code></div>
+            <div class="env-pills"><code>BANK_TRANSACTIONS_FILE</code><code>GOOGLE_CALENDAR_ACCESS_TOKEN</code><code>SCHOOL_EVENTS_URL</code></div>
           </div>
         </div>
       </section>
@@ -600,7 +935,7 @@ def auth_page(mode: str = "login") -> str:
 
 def assistant_context(profile: dict[str, str]) -> dict[str, Any]:
     integrations = all_integrations(profile)
-    summary = finance_summary(integrations["plaid"])
+    summary = finance_summary(integrations["finance"])
     events = integrations["calendar"].get("events", [])[:8]
     school = integrations["school"].get("items", [])[:8]
     health = integrations["health"].get("items", [])[:8]
@@ -731,7 +1066,7 @@ def google_connect_action(handler: BaseHTTPRequestHandler | None = None, profile
 def home_page(profile: dict[str, str], handler: BaseHTTPRequestHandler | None = None) -> str:
     first_name = profile.get("displayName", "Family").split()[0]
     integrations = all_integrations(profile)
-    summary = finance_summary(integrations["plaid"])
+    summary = finance_summary(integrations["finance"])
     events = integrations["calendar"].get("events", [])
     school_items = integrations["school"].get("items", [])
     logistics_items = integrations["logistics"].get("items", [])
@@ -746,8 +1081,8 @@ def home_page(profile: dict[str, str], handler: BaseHTTPRequestHandler | None = 
     else:
         focus_card = empty_state(
             "No live focus item",
-            "Connect Google Calendar, school, or logistics endpoints to populate the dashboard focus card.",
-            ["GOOGLE_CALENDAR_ACCESS_TOKEN", "SCHOOL_EVENTS_URL", "LOGISTICS_EVENTS_URL"],
+            "Connect iCalendar, Google Calendar, school, or logistics endpoints to populate the dashboard focus card.",
+            ["ICALENDAR_URL", "GOOGLE_CALENDAR_ACCESS_TOKEN", "SCHOOL_EVENTS_URL"],
         )
 
     alerts = "".join(
@@ -766,7 +1101,7 @@ def home_page(profile: dict[str, str], handler: BaseHTTPRequestHandler | None = 
     <header class="page-title"><h1>Good morning, {esc(first_name)}.</h1><p>Live data appears only from configured API integrations.</p></header>
     <div class="dashboard-grid">
       {card(focus_card, 'hero span-3')}
-      {card(f'<div class="split"><span class="round-icon">W</span><span class="status {"success" if integrations["plaid"].get("connected") and not integrations["plaid"].get("error") else ""}">Plaid</span></div><h3>Liquidity</h3><p class="metric">{money(summary["liquidity"])}</p><hr><div class="split"><small>Expenses</small><strong>{money(summary["expenses"])}</strong></div>')}
+      {card(f'<div class="split"><span class="round-icon">W</span><span class="status {"success" if integrations["finance"].get("connected") and not integrations["finance"].get("error") else ""}">Finance</span></div><h3>Liquidity</h3><p class="metric">{money(summary["liquidity"])}</p><hr><div class="split"><small>Expenses</small><strong>{money(summary["expenses"])}</strong></div>')}
       {card('<h3>Logistics & Alerts</h3>' + alerts, 'span-2')}
       {card(weather_html, 'center')}
       {card(f'<h3>API Status</h3><div class="sync-cloud">{connected_count}/{len(integrations)}</div><a class="button muted" href="/sync">Manage</a>', 'center')}
@@ -776,27 +1111,28 @@ def home_page(profile: dict[str, str], handler: BaseHTTPRequestHandler | None = 
 
 
 def finance_page(profile: dict[str, str]) -> str:
-    plaid = get_plaid()
-    summary = finance_summary(plaid)
+    finance = get_finance()
+    summary = finance_summary(finance)
+    provider_detail = f"Provider: {provider_label(finance.get('provider', 'direct'))}."
     categories = summary["categories"]
     total_category = sum(categories.values())
     slices = "".join(
         f'<li><span style="width:{pct(value, total_category):.1f}%"></span><div>{esc(name)}<strong>{money(value)}</strong></div></li>'
         for name, value in sorted(categories.items(), key=lambda item: item[1], reverse=True)
-    ) or empty_state("No transaction categories", "Connect Plaid and sync transactions to build the burn profile.", ["PLAID_CLIENT_ID", "PLAID_SECRET", "PLAID_ACCESS_TOKEN"])
+    ) or empty_state("No transaction categories", "Add a local bank transaction export, connect a finance JSON endpoint, or opt into Plaid.", ["BANK_TRANSACTIONS_FILE", "FINANCE_DATA_URL", "FINANCE_PROVIDER"])
     transactions = "".join(
         f'<div class="list-row"><div><strong>{esc(tx.get("name", "Transaction"))}</strong><small>{esc(tx.get("date", ""))}</small></div><div class="amount">{money(tx.get("amount"))}</div></div>'
         for tx in summary["transactions"][:12]
-    ) or empty_state("No transactions", "Plaid returned no transactions or is not configured.", ["PLAID_ACCESS_TOKEN"])
+    ) or empty_state("No transactions", "No finance transactions are configured yet.", ["BANK_TRANSACTIONS_FILE", "FINANCE_DATA_URL"])
     accounts = "".join(
         f'<div class="vault"><small>{esc(account.get("official_name") or account.get("subtype") or "Account")}</small><strong>{esc(account.get("name", "Linked account"))}</strong><p>{money(account.get("balances", {}).get("current"))}</p><small>{esc(account.get("mask", ""))}</small></div>'
         for account in summary["accounts"]
-    ) or empty_state("No linked accounts", "Create and supply a Plaid access token for a real institution or sandbox item.", ["PLAID_ACCESS_TOKEN"])
+    ) or empty_state("No linked accounts", "Add a local accounts file, a finance JSON endpoint, or an optional Plaid access token.", ["BANK_ACCOUNTS_FILE", "FINANCE_DATA_URL", "PLAID_ACCESS_TOKEN"])
 
     body = f"""
-    <header class="page-title row-title"><div><h1>Finance Center</h1><p>Backed by Plaid when credentials are configured.</p></div><a class="button primary" href="/sync">Connection Status</a></header>
+    <header class="page-title row-title"><div><h1>Finance Center</h1><p>Works with local bank exports, your own finance API, or optional Plaid.</p></div><a class="button primary" href="/sync">Connection Status</a></header>
     <div class="grid-12">
-      {card(f'<span class="eyebrow">Collective Liquidity</span><p class="big-number">{money(summary["liquidity"])}</p><div class="stats"><span>Income <b>{money(summary["income"])}</b></span><span>Expenses <b>{money(summary["expenses"])}</b></span><span>Linked Accounts <b>{len(summary["accounts"])}</b></span></div>{integration_card("Plaid", plaid.get("connected", False), "Configured via Plaid API.", plaid.get("error", ""))}', 'col-8')}
+      {card(f'<span class="eyebrow">Collective Liquidity</span><p class="big-number">{money(summary["liquidity"])}</p><div class="stats"><span>Income <b>{money(summary["income"])}</b></span><span>Expenses <b>{money(summary["expenses"])}</b></span><span>Linked Accounts <b>{len(summary["accounts"])}</b></span></div>{integration_card("Finance", finance.get("connected", False), provider_detail, finance.get("error", ""))}', 'col-8')}
       {card('<h3>Burn Profile</h3><ul class="bar-list">' + slices + '</ul>', 'col-4')}
       {card('<div class="split"><h3>Sync Feed</h3><span class="status">Live</span></div>' + transactions, 'col-8')}
       {card('<h3>External Vaults</h3>' + accounts, 'col-4')}
@@ -831,7 +1167,7 @@ def logistics_page(profile: dict[str, str]) -> str:
       {card(f'<div class="split"><h2>School Operations</h2><span class="status">Live API</span></div><div class="timeline">{timeline}</div>', 'col-8')}
       <div class="col-4 stack">
         {card('<h3>Health Status</h3>' + health_items)}
-        {card(integration_card("School API", school.get("connected", False), "School endpoint configured.", school.get("error", "")) + integration_card("Logistics API", logistics.get("connected", False), "Logistics endpoint configured.", logistics.get("error", "")), 'dark')}
+        {card(integration_card("School API", school.get("connected", False), f"Provider: {provider_label(school.get('provider', 'custom_json'))}.", school.get("error", "")) + integration_card("Logistics API", logistics.get("connected", False), "Logistics endpoint configured.", logistics.get("error", "")), 'dark')}
       </div>
       <section class="col-12"><div class="row-title"><div><h2>Daily Logistics</h2><p>Transport and coverage from your configured source.</p></div></div><div class="mini-grid">{logistic_cards}</div></section>
     </div>
@@ -861,11 +1197,11 @@ def calendar_page(profile: dict[str, str], handler: BaseHTTPRequestHandler | Non
     upcoming = "".join(
         card(f'<small>{esc(event_start(event))}</small><h3>{esc(event.get("summary", "Calendar event"))}</h3><p>{esc(event.get("location", ""))}</p>', "")
         for event in events[:4]
-    ) or empty_state("No calendar events", "Connect Google Calendar to populate this month.", ["GOOGLE_CALENDAR_ACCESS_TOKEN", "GOOGLE_CALENDAR_API_KEY"])
+    ) or empty_state("No calendar events", "Connect an iCalendar feed or Google Calendar to populate this month.", ["ICALENDAR_URL", "ICALENDAR_FILE", "GOOGLE_CALENDAR_ACCESS_TOKEN"])
 
-    calendar_detail = "Connected through OAuth." if calendar_data.get("token_source") == "oauth" else "Calendar API configured."
+    calendar_detail = "Connected through iCalendar." if calendar_data.get("token_source") == "icalendar" else "Connected through OAuth." if calendar_data.get("token_source") == "oauth" else "Calendar API configured."
     body = f"""
-    <header class="page-title row-title"><div><h1>{esc(first.strftime("%B %Y"))}</h1><p>{len(events)} live events loaded</p></div>{integration_card("Google Calendar", calendar_data.get("connected", False), calendar_detail, calendar_data.get("error", ""), google_connect_action(handler, profile))}</header>
+    <header class="page-title row-title"><div><h1>{esc(first.strftime("%B %Y"))}</h1><p>{len(events)} live events loaded</p></div>{integration_card("Calendar", calendar_data.get("connected", False), calendar_detail, calendar_data.get("error", ""), google_connect_action(handler, profile))}</header>
     <section class="calendar-grid">
       {"".join(f"<b>{day}</b>" for day in ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"])}
       {"".join(cells)}
@@ -881,10 +1217,10 @@ def calendar_page(profile: dict[str, str], handler: BaseHTTPRequestHandler | Non
 def sync_page(profile: dict[str, str], handler: BaseHTTPRequestHandler | None = None) -> str:
     integrations = all_integrations(profile)
     cards = "".join(
-        integration_card(label, data.get("connected", False), detail, data.get("error", ""), google_connect_action(handler, profile) if label == "Google Calendar" else "")
+        integration_card(label, data.get("connected", False), detail, data.get("error", ""), google_connect_action(handler, profile) if label == "Calendar" else "")
         for label, detail, data in [
-            ("Plaid", "Bank balances and transactions.", integrations["plaid"]),
-            ("Google Calendar", "Family calendar events.", integrations["calendar"]),
+            ("Finance", "Bank balances and transactions.", integrations["finance"]),
+            ("Calendar", "iCalendar or Google family events.", integrations["calendar"]),
             ("School", "School operations endpoint.", integrations["school"]),
             ("Health", "Health events endpoint.", integrations["health"]),
             ("Logistics", "Daily logistics endpoint.", integrations["logistics"]),
@@ -909,6 +1245,172 @@ def sync_page(profile: dict[str, str], handler: BaseHTTPRequestHandler | None = 
     </div>
     """
     return layout("Sync", body, profile, "/sync")
+
+
+def setup_value(name: str, placeholder: str = "", input_type: str = "text", reveal: bool = False) -> str:
+    value = env(name)
+    display_value = value if reveal else ""
+    status = masked(value) if not reveal else value or "Not saved"
+    return f"""
+    <label>{esc(placeholder or name)}
+      <input name="{esc(name)}" type="{esc(input_type)}" value="{esc(display_value)}" placeholder="{esc(status)}">
+    </label>
+    """
+
+
+def setup_select(name: str, label: str, options: list[tuple[str, str]], default: str = "") -> str:
+    current = env(name, default)
+    if name == "FINANCE_PROVIDER" and current == "local":
+        current = "direct"
+    option_html = "".join(
+        f'<option value="{esc(value)}" {"selected" if value == current else ""}>{esc(text)}</option>'
+        for value, text in options
+    )
+    return f"""
+    <label>{esc(label)}
+      <select name="{esc(name)}">{option_html}</select>
+    </label>
+    """
+
+
+def setup_card(title: str, plain: str, steps: list[str], fields: list[str], extra: str = "") -> str:
+    step_html = "".join(f"<li>{esc(step)}</li>" for step in steps)
+    field_html = "".join(fields)
+    return card(
+        f"""
+        <div class="setup-card-head">
+          <div><h2>{esc(title)}</h2><p>{esc(plain)}</p></div>
+          <span class="status {"success" if any(env_name in field for field in fields for env_name in SETUP_FIELDS if env(env_name)) else ""}">Setup</span>
+        </div>
+        <ol class="setup-steps">{step_html}</ol>
+        <div class="field-grid">{field_html}</div>
+        {extra}
+        """,
+        "col-12 setup-card",
+    )
+
+
+def connections_page(profile: dict[str, str], notice: str = "", error: str = "") -> str:
+    redirect_uri = google_redirect_uri()
+    notice_html = f'<div class="success-box">{esc(notice)}</div>' if notice else ""
+    error_html = f'<div class="empty-state"><h3>Could not save everything</h3><p>{esc(error)}</p></div>' if error else ""
+    google_action = google_connect_action(None, profile)
+    body = f"""
+    <header class="page-title row-title">
+      <div><h1>Connection Setup</h1><p>Add test keys in plain language. Secrets are saved only to your local <code>.env.local</code> file, which is ignored by git.</p></div>
+      <a class="button muted" href="/sync">View Health</a>
+    </header>
+    <form class="grid-12 setup-form" method="post" action="/connections">
+      {notice_html}
+      {error_html}
+      {setup_card(
+        "Assistant Brain",
+        "This is the key that lets the bottom-right assistant generate real answers instead of readiness checks.",
+        [
+          "Open Google AI Studio and create an API key.",
+          "Paste the key here.",
+          "Ask the assistant a question from any page.",
+        ],
+        [
+          setup_value("GEMINI_API_KEY", "Gemini API key"),
+          setup_value("GEMINI_MODEL", "Model name", reveal=True),
+        ],
+        '<p class="help-copy"><a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer">Open Google AI Studio keys</a></p>',
+      )}
+      {setup_card(
+        "Family Calendar",
+        "Use iCalendar for Apple Calendar, Outlook, school feeds, or any .ics subscription. Google OAuth is still available if you need it.",
+        [
+          "For iCalendar, paste a public or private .ics subscription URL, or a local .ics file path.",
+          "Choose iCalendar or Google Calendar from the menu.",
+          "For Google, create an OAuth web client and add this redirect URL exactly: " + redirect_uri,
+        ],
+        [
+          setup_select("CALENDAR_PROVIDER", "Calendar system", [("auto", "Auto-detect"), ("icalendar", "iCalendar"), ("google", "Google Calendar")], "auto"),
+          setup_value("ICALENDAR_URL", "iCalendar subscription URL", reveal=True),
+          setup_value("ICALENDAR_FILE", "Local .ics file path", reveal=True),
+          setup_value("ICALENDAR_API_TOKEN", "iCalendar bearer token"),
+          setup_value("GOOGLE_CLIENT_ID", "Google client ID"),
+          setup_value("GOOGLE_CLIENT_SECRET", "Google client secret"),
+          setup_value("GOOGLE_REDIRECT_URI", "Redirect URL", reveal=True),
+          setup_value("GOOGLE_CALENDAR_ID", "Calendar to read", reveal=True),
+        ],
+        f'<div class="button-row">{google_action}<a class="button muted small" href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noreferrer">Open Google credentials</a></div>',
+      )}
+      {setup_card(
+        "Finance",
+        "Start with Direct for local bank exports or your own API. Switch to Plaid later if you choose a paid aggregator.",
+        [
+          "Download CSV files from your bank for accounts or transactions.",
+          "Keep those files on this computer and paste their paths here.",
+          "Choose Direct for files or your own endpoint, Custom API for a separate internal API, or Plaid only if you choose Plaid.",
+        ],
+        [
+          setup_select("FINANCE_PROVIDER", "Bank connection", [("direct", "Direct"), ("plaid", "Plaid"), ("json", "Custom API")], "direct"),
+          setup_value("BANK_ACCOUNTS_FILE", "Local accounts CSV or JSON path", reveal=True),
+          setup_value("BANK_TRANSACTIONS_FILE", "Local transactions CSV or JSON path", reveal=True),
+          setup_value("FINANCE_DATA_URL", "Your own finance JSON endpoint", reveal=True),
+          setup_value("FINANCE_API_TOKEN", "Finance endpoint token"),
+          setup_value("PLAID_CLIENT_ID", "Plaid client ID"),
+          setup_value("PLAID_SECRET", "Plaid sandbox secret"),
+          setup_value("PLAID_ACCESS_TOKEN", "Plaid access token"),
+          setup_value("PLAID_TRANSACTION_COUNT", "Transactions to load", input_type="number", reveal=True),
+        ],
+        '<div class="button-row"><button class="button dark small" name="action" value="plaid_sandbox" type="submit">Create optional Plaid sandbox connection</button><a class="button muted small" href="https://dashboard.plaid.com/team/keys" target="_blank" rel="noreferrer">Open Plaid keys</a></div>',
+      )}
+      {setup_card(
+        "Weather",
+        "Weather.gov does not need a key. Add a latitude and longitude and the app handles the rest.",
+        [
+          "Find your latitude and longitude from a map app.",
+          "Paste the numbers here.",
+          "Refresh the home page to see the forecast.",
+        ],
+        [
+          setup_value("FILIATION_LAT", "Latitude", reveal=True),
+          setup_value("FILIATION_LON", "Longitude", reveal=True),
+        ],
+      )}
+      {setup_card(
+        "School",
+        "Choose the school system your family uses. Most schools still require a district-approved API or export URL, so the URL/token fields stay flexible.",
+        [
+          "Pick Infinite Campus, Schoology, Canvas, or Custom.",
+          "Paste the district-approved API/export URL.",
+          "Add a token only if that school system requires one.",
+        ],
+        [
+          setup_select("SCHOOL_PROVIDER", "School system", [("infinite_campus", "Infinite Campus"), ("schoology", "Schoology"), ("canvas", "Canvas"), ("custom_json", "Custom JSON")], "custom_json"),
+          setup_value("SCHOOL_EVENTS_URL", "School feed URL", reveal=True),
+          setup_value("SCHOOL_API_TOKEN", "School token"),
+        ],
+      )}
+      {setup_card(
+        "Other Family Systems",
+        "For health, logistics, family directory, or request tools, paste a JSON feed URL. The app accepts a list, or an object with items, data, or results.",
+        [
+          "Use an existing service URL, a small backend you own, or a temporary JSON endpoint.",
+          "Add a token only if that service requires one.",
+          "The assistant can read whatever these feeds return.",
+        ],
+        [
+          setup_value("HEALTH_EVENTS_URL", "Health feed URL", reveal=True),
+          setup_value("HEALTH_API_TOKEN", "Health token"),
+          setup_value("LOGISTICS_EVENTS_URL", "Logistics feed URL", reveal=True),
+          setup_value("LOGISTICS_API_TOKEN", "Logistics token"),
+          setup_value("P2P_REQUESTS_URL", "Request feed URL", reveal=True),
+          setup_value("P2P_API_TOKEN", "Request token"),
+          setup_value("FAMILY_MEMBERS_URL", "Family directory URL", reveal=True),
+          setup_value("FAMILY_API_TOKEN", "Family token"),
+        ],
+      )}
+      <section class="col-12 split setup-actions">
+        <p class="help-copy">Leave a box blank to keep the existing saved value. Saved secrets are masked on reload.</p>
+        <button class="button primary" name="action" value="save" type="submit">Save connection settings</button>
+      </section>
+    </form>
+    """
+    return layout("Connections", body, profile, "/connections")
 
 
 def settings_page(profile: dict[str, str], saved: bool = False) -> str:
@@ -942,7 +1444,7 @@ CSS = r"""
 *{box-sizing:border-box}body{margin:0;background:var(--base);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}a{color:inherit;text-decoration:none}button,input,textarea{font:inherit}button{cursor:pointer}code{background:#eef2ff;color:#4338ca;border-radius:.5rem;padding:.3rem .45rem;font-size:.72rem}
 .app-shell{min-height:100vh;display:grid;grid-template-columns:16rem minmax(0,1fr)}.sidebar,.topbar{background:white;border-color:#e2e8f0}.sidebar{position:sticky;top:0;height:100vh;padding:1.5rem;border-right:1px solid #e2e8f0}.brand{display:flex;align-items:center;gap:.75rem;margin-bottom:2rem;font-size:1.5rem}.brand-mark{display:grid;place-items:center;width:2.5rem;height:2.5rem;border-radius:.85rem;background:var(--primary);color:white;font-weight:900}.nav-list{display:flex;flex-direction:column;gap:.25rem}.nav-item{width:100%;border:0;background:transparent;display:flex;align-items:center;gap:.75rem;padding:.75rem 1rem;border-radius:.85rem;color:#475569;font-weight:800}.nav-item.active,.nav-item:hover{background:#eef2ff;color:var(--primary)}.nav-item.danger{color:var(--danger);margin-top:1rem}.family-pill{margin-top:2rem;padding:1rem;border-radius:1rem;background:#f8fafc;color:#64748b;font-size:.75rem}.main{min-width:0}.topbar{height:4rem;position:sticky;top:0;z-index:2;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;justify-content:space-between;padding:0 2rem}.user-chip{display:flex;align-items:center;gap:.75rem}.user-chip img,.avatar-fallback{width:2.5rem;height:2.5rem;object-fit:cover;border-radius:999px}.avatar-fallback{display:grid;place-items:center;background:#eef2ff;color:var(--primary);font-weight:950}.user-chip small{display:block;color:var(--secondary);font-size:.65rem;text-transform:uppercase;font-weight:900;letter-spacing:.08em}.content{padding:2rem;max-width:88rem}.mobile-nav{display:none}
 .page-title{margin-bottom:2rem}.page-title h1{font-size:clamp(2.35rem,5vw,4rem);line-height:.96;margin:.2rem 0;font-weight:950;letter-spacing:0}.page-title p,.muted-copy{font-size:1.05rem;color:#64748b;font-weight:650}.row-title,.split{display:flex;align-items:center;justify-content:space-between;gap:1rem}.button-row{display:flex;gap:.75rem;flex-wrap:wrap}.button{border:0;border-radius:1rem;padding:.9rem 1.25rem;font-weight:900;transition:.2s;display:inline-block}.button.primary{background:var(--primary);color:white;box-shadow:0 12px 28px rgba(79,70,229,.22)}.button.light{background:white;color:var(--primary)}.button.ghost{background:rgba(255,255,255,.18);color:white}.button.muted{background:#f1f5f9;color:#64748b}.button.dark{background:#0f172a;color:white}.button.small{padding:.55rem .9rem;font-size:.8rem}.button.full{width:100%;text-align:center}.card{background:white;border:1px solid #e2e8f0;border-radius:1.5rem;padding:2rem;box-shadow:0 1px 3px rgba(15,23,42,.08)}.dashboard-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1.5rem}.grid-12{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:1.5rem}.span-3{grid-column:span 3}.span-2{grid-column:span 2}.col-4{grid-column:span 4}.col-8{grid-column:span 8}.col-12{grid-column:span 12}.stack{display:flex;flex-direction:column;gap:1.5rem}.hero{background:linear-gradient(135deg,var(--primary),var(--primary-2));color:white;min-height:18rem;display:flex;flex-direction:column;justify-content:space-between;overflow:hidden}.hero h2{font-size:clamp(2rem,4vw,3.25rem);line-height:1.05;margin:.75rem 0}.hero p{color:rgba(255,255,255,.76)}.eyebrow,.status{display:inline-block;border-radius:999px;background:rgba(79,70,229,.1);color:var(--primary);font-size:.65rem;text-transform:uppercase;letter-spacing:.14em;font-weight:950;padding:.4rem .7rem}.status.success{background:#ecfdf5;color:#059669}.status.danger{background:#fff1f2;color:var(--danger)}.hero .eyebrow{background:rgba(255,255,255,.2);color:white}.metric,.big-number{font-size:3.2rem;font-weight:950;margin:.6rem 0}.round-icon,.request-icon{display:grid;place-items:center;width:3rem;height:3rem;border-radius:1rem;background:#eef2ff;color:var(--primary);font-weight:950}.alert-row,.list-row{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:1rem;border-radius:1rem;background:#f8fafc;margin-top:.75rem}.alert-row small,.list-row small,.vault small,.mini-card small{display:block;color:#94a3b8;font-size:.7rem;text-transform:uppercase;font-weight:900;letter-spacing:.08em}.center{text-align:center}.weather,.sync-cloud{font-size:2.8rem;font-weight:950}.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;border-top:1px solid #e2e8f0;margin-top:2rem;padding-top:2rem}.stats span{color:#94a3b8;text-transform:uppercase;font-size:.7rem;font-weight:900}.stats b{display:block;color:var(--ink);font-size:1.4rem;text-transform:none}.info-box,.success-box,.empty-state{padding:1rem;border-radius:1rem;background:#eef2ff;color:#4338ca;font-weight:750}.empty-state{background:#f8fafc;color:#64748b;border:1px dashed #cbd5e1}.empty-state h3{margin:.1rem 0;color:#334155}.env-pills{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.75rem}.integration-card{background:#f8fafc;border:1px solid #e2e8f0;border-radius:1rem;padding:1rem;margin:.75rem 0}.integration-card p{color:#64748b;font-size:.85rem;margin:.5rem 0 0}.vault{background:#f8fafc;border-radius:1rem;padding:1rem;margin-top:1rem}.vault p{font-size:1.4rem;font-weight:950;margin:.5rem 0}.dark{background:#0f172a;color:white}.dark p{color:rgba(255,255,255,.68)}.dark .integration-card{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.12)}.timeline-item{display:flex;gap:1rem;margin:1.25rem 0}.timeline-item>span{width:1rem;height:1rem;background:var(--primary);border-radius:999px;margin-top:.35rem;box-shadow:0 0 0 .25rem white}.timeline-item small{color:var(--primary);font-size:.7rem;text-transform:uppercase;font-weight:950;letter-spacing:.08em}.timeline-item h3{margin:.15rem 0}.timeline-item p{color:#64748b;margin:.25rem 0}.mini-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1rem}.mini-card{background:#f8fafc}.calendar-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:1rem;margin-bottom:2rem}.calendar-grid>b{text-align:center;color:#94a3b8;text-transform:uppercase;font-size:.7rem;letter-spacing:.16em}.calendar-cell{min-height:7rem;border-radius:1.2rem;background:white;border:1px solid #e2e8f0;padding:1rem}.calendar-cell.today{background:var(--primary);color:white}.calendar-cell.empty{background:rgba(248,250,252,.6);border:0}.calendar-cell small{display:block;margin-top:.6rem;color:#047857;background:#ecfdf5;border-radius:.5rem;padding:.25rem;font-size:.65rem;font-weight:900}.bar-list{list-style:none;padding:0;margin:1rem 0}.bar-list li{margin:.85rem 0}.bar-list span{display:block;height:.5rem;min-width:.3rem;background:var(--primary);border-radius:999px;margin-bottom:.35rem}.bar-list div{display:flex;justify-content:space-between;gap:.75rem;color:#64748b;font-weight:800}.node-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin:2rem 0}.node-grid span{color:rgba(255,255,255,.45);font-size:.7rem;text-transform:uppercase;font-weight:900}.node-grid b{display:block;color:white;font-size:2rem;text-transform:none}.node-grid small{display:block;color:#34d399}.profile-photo{display:grid;place-items:center}.profile-photo img,.profile-photo .avatar-fallback{width:8rem;height:8rem;border-radius:999px}.settings-grid label,.auth-card label{display:flex;flex-direction:column;gap:.45rem;color:#64748b;text-transform:uppercase;letter-spacing:.08em;font-size:.7rem;font-weight:950}.settings-grid input,.settings-grid textarea,.auth-card input{border:0;background:#f8fafc;border-radius:1rem;padding:1rem;color:var(--ink);text-transform:none;letter-spacing:0}.settings-grid textarea{min-height:8rem;resize:vertical}.field-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}.success-inline{color:#059669;font-weight:900}.auth-page{min-height:100vh;display:grid;grid-template-columns:1fr 1.35fr;gap:4rem;align-items:center;padding:4rem;max-width:90rem;margin:auto}.auth-copy h1{font-size:clamp(3rem,7vw,5.4rem);line-height:.9;margin:3rem 0 1.5rem;font-weight:950}.auth-copy p{font-size:1.2rem;color:#64748b;max-width:34rem}.feature-row{display:flex;gap:1rem;flex-wrap:wrap;margin-top:3rem}.feature-row span{background:white;border-radius:1rem;padding:1rem;font-weight:900}.auth-card{background:white;border-radius:2rem;padding:2rem;box-shadow:0 12px 36px rgba(15,23,42,.1)}.mode-tabs{display:inline-flex;background:#f8fafc;border-radius:999px;padding:.35rem;margin-bottom:2rem}.mode-tabs a{padding:.8rem 2rem;border-radius:999px;font-weight:950;color:#94a3b8}.mode-tabs a.active{background:white;color:var(--primary);box-shadow:0 1px 3px rgba(15,23,42,.12)}.auth-grid{display:grid;grid-template-columns:1fr 1fr;gap:2rem}.form-stack{display:flex;flex-direction:column;gap:1rem}.onboarding{background:#f8fafc;border-radius:1.5rem;padding:1.5rem}
-.form-stack label,.assistant-mini label{display:flex;flex-direction:column;gap:.45rem;color:#64748b;text-transform:uppercase;letter-spacing:.08em;font-size:.7rem;font-weight:950}.form-stack textarea,.assistant-mini textarea{border:0;background:#f8fafc;border-radius:1rem;padding:1rem;color:var(--ink);text-transform:none;letter-spacing:0;resize:vertical}.form-stack textarea{min-height:9rem}.assistant-mini{display:flex;flex-direction:column;gap:1rem}.assistant-mini textarea{min-height:8rem}.assistant-answer{color:#334155;font-size:1rem;line-height:1.65}
+.form-stack label,.assistant-mini label,.setup-form label{display:flex;flex-direction:column;gap:.45rem;color:#64748b;text-transform:uppercase;letter-spacing:.08em;font-size:.7rem;font-weight:950}.form-stack textarea,.assistant-mini textarea,.setup-form input,.setup-form select{border:0;background:#f8fafc;border-radius:1rem;padding:1rem;color:var(--ink);text-transform:none;letter-spacing:0;resize:vertical}.setup-form select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,#64748b 50%),linear-gradient(135deg,#64748b 50%,transparent 50%);background-position:calc(100% - 1.2rem) 1.35rem,calc(100% - .85rem) 1.35rem;background-size:.35rem .35rem,.35rem .35rem;background-repeat:no-repeat}.form-stack textarea{min-height:9rem}.assistant-mini{display:flex;flex-direction:column;gap:1rem}.assistant-mini textarea{min-height:8rem}.assistant-answer{color:#334155;font-size:1rem;line-height:1.65}.setup-form>.success-box,.setup-form>.empty-state{grid-column:1/-1}.setup-card{display:flex;flex-direction:column;gap:1rem}.setup-card-head{display:flex;justify-content:space-between;gap:1rem}.setup-card-head h2{margin:.1rem 0}.setup-card-head p,.help-copy{color:#64748b;margin:.35rem 0;line-height:1.5}.setup-steps{margin:0;padding-left:1.3rem;color:#475569;line-height:1.65;font-weight:700}.setup-actions{align-items:center}
 .assistant-widget{position:fixed;right:1.5rem;bottom:1.5rem;z-index:20}.assistant-fab{width:4rem;height:4rem;border:0;border-radius:999px;background:var(--primary);color:white;font-weight:950;font-size:1.25rem;box-shadow:0 18px 38px rgba(79,70,229,.34)}.assistant-popover{position:absolute;right:0;bottom:5rem;width:min(24rem,calc(100vw - 2rem));background:white;border:1px solid #e2e8f0;border-radius:1.5rem;padding:1rem;box-shadow:0 24px 60px rgba(15,23,42,.18);display:none}.assistant-widget.open .assistant-popover{display:block}.assistant-popover-head{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;margin-bottom:1rem}.assistant-popover-head small{display:block;color:#64748b;font-size:.72rem;text-transform:uppercase;font-weight:900;letter-spacing:.08em}.assistant-close{border:0;background:#f1f5f9;color:#64748b;width:2rem;height:2rem;border-radius:999px;font-weight:900}.assistant-popover .assistant-mini textarea{min-height:7rem}.assistant-popover .button-row{justify-content:space-between}
 @media(max-width:1200px){.dashboard-grid{grid-template-columns:repeat(2,1fr)}.span-3,.span-2{grid-column:span 2}}@media(max-width:760px){.app-shell{display:block}.sidebar{display:none}.topbar{padding:0 1rem}.content{padding:1rem 1rem 6rem}.mobile-nav{display:flex;position:fixed;bottom:0;left:0;right:0;background:white;border-top:1px solid #e2e8f0;justify-content:space-around;padding:.5rem;z-index:5}.mobile-nav .nav-item{font-size:.7rem;flex-direction:column;gap:.2rem;padding:.45rem}.assistant-widget{right:1rem;bottom:5.5rem}.assistant-fab{width:3.5rem;height:3.5rem}.dashboard-grid,.grid-12,.auth-page,.auth-grid,.field-grid,.mini-grid{grid-template-columns:1fr}.col-4,.col-8,.col-12,.span-3,.span-2{grid-column:auto}.row-title,.split{align-items:flex-start;flex-direction:column}.calendar-grid{gap:.35rem}.calendar-cell{min-height:5rem;padding:.5rem;border-radius:.8rem}.auth-page{padding:1rem}.auth-copy h1{margin:1.5rem 0;font-size:3rem}.node-grid,.stats{grid-template-columns:1fr}}
 """
@@ -1091,6 +1593,7 @@ class FiliationHandler(BaseHTTPRequestHandler):
             "/logistics": logistics_page,
             "/calendar": calendar_page,
             "/sync": sync_page,
+            "/connections": connections_page,
             "/settings": settings_page,
         }
         page = routes.get(path)
@@ -1147,6 +1650,24 @@ class FiliationHandler(BaseHTTPRequestHandler):
             question = data.get("question", "")
             answer, generated = ask_assistant(profile, question)
             self.send_html(assistant_page(profile, question, answer, generated))
+            return
+
+        if path == "/connections":
+            profile = self.require_profile()
+            if not profile:
+                return
+            data = read_form(self)
+            updates = {key: data.get(key, "") for key in SETUP_FIELDS}
+            try:
+                write_local_env(updates)
+                if data.get("action") == "plaid_sandbox":
+                    create_plaid_sandbox_access_token()
+                    notice = "Saved settings and created a Plaid sandbox bank connection."
+                else:
+                    notice = "Saved connection settings."
+                self.send_html(connections_page(profile, notice=notice))
+            except IntegrationError as error:
+                self.send_html(connections_page(profile, error=str(error)), HTTPStatus.BAD_REQUEST)
             return
 
         self.redirect("/")
